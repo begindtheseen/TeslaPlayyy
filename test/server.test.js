@@ -67,24 +67,21 @@ test('session: catalog asset resolves to the canvas player with probed codecs', 
   assert.ok(s.heartbeatIntervalMs >= 5000);
 });
 
-test('session: YouTube video resolves to the official IFrame player when no authorized media exists', async () => {
-  const s = await createPlaybackSession({ kind: 'youtube', videoId: 'aqz-KE-bpKQ', prefer: 'canvas' });
-  assert.equal(s.player, 'youtube-iframe');
-  assert.equal(s.youtube.videoId, 'aqz-KE-bpKQ');
-  assert.equal(s.youtube.canvasAvailable, false);
-  assert.match(s.notice, /No authorized raw-media source/);
-  assert.equal(s.canvas, undefined);
+test('session: YouTube video without a licensed source is refused (no iframe fallback)', async () => {
+  await assert.rejects(createPlaybackSession({ kind: 'youtube', videoId: 'aqz-KE-bpKQ' }),
+    e => e instanceof PlaybackError && e.status === 409 && e.code === 'no_authorized_media' && e.extra.videoId === 'aqz-KE-bpKQ');
 });
 
-test('session: operator-mapped YouTube id plays a licensed copy on the canvas player', { skip: !HAS_FFMPEG }, async () => {
+test('session: operator-mapped YouTube id streams its licensed copy via /api/youtube/stream to the canvas player', { skip: !HAS_FFMPEG }, async () => {
   process.env.YOUTUBE_AUTHORIZED_MAP = 'AAAAAAAAAAA=demo-av';
   try {
-    const s = await createPlaybackSession({ kind: 'youtube', videoId: 'AAAAAAAAAAA', prefer: 'canvas' });
+    const s = await createPlaybackSession({ kind: 'youtube', videoId: 'AAAAAAAAAAA' });
     assert.equal(s.player, 'canvas');
     assert.equal(s.asset.id, 'demo-av');
-    const iframe = await createPlaybackSession({ kind: 'youtube', videoId: 'AAAAAAAAAAA' });
-    assert.equal(iframe.player, 'youtube-iframe');
-    assert.equal(iframe.youtube.canvasAvailable, true);
+    assert.match(s.canvas.streamUrl, /^\/api\/youtube\/stream\/AAAAAAAAAAA\?session=/);
+    // The route handler delegates to handleStream with the mapped asset; exercise that path directly.
+    const r = await fetchAndDemux(`${base}/stream/demo-av?session=${s.sessionId}`);
+    assert.equal(r.video.length, 240);
   } finally { delete process.env.YOUTUBE_AUTHORIZED_MAP; }
 });
 

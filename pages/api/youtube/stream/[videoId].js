@@ -15,7 +15,7 @@ export default function handler(req, res) {
     return res.status(501).json({
       error: 'No authorized media source for this YouTube video',
       code: 'no_authorized_media',
-      detail: 'YouTube does not provide raw audio/video streams to third-party players. Use player "youtube-iframe" from POST /api/playback/session, or map this video to a licensed asset with YOUTUBE_AUTHORIZED_MAP.',
+      detail: 'YouTube does not provide raw audio/video streams to third-party players. Map this video to a licensed media asset with YOUTUBE_AUTHORIZED_MAP (see STREAMING_RESEARCH.md).',
     });
   }
   return handleStream(req, res, { assetId: asset.id, sessionId: req.query.session, t: req.query.t });

@@ -32,9 +32,9 @@ export default function Home() {
     setStatus(`Opening ${label}…`);
     try {
       const s = await createSession(source);
-      setStatus(s.player === 'canvas' ? 'Streaming MPEG-TS into the canvas player' : 'Playing through the official YouTube player');
+      setStatus('Streaming MPEG-TS into the canvas player');
       await player.current?.play(s);
-    } catch (e) { setStatus(e.message); }
+    } catch (e) { setStatus(e.message); player.current?.fail(e.message, source.title || label); }
   }
 
   async function search(e) {
@@ -63,7 +63,7 @@ export default function Home() {
       <main>
         <header>
           <b>CanvasTube</b>
-          <span>YouTube search · official YouTube player · custom WebCodecs canvas player for authorized streams</span>
+          <span>YouTube search · MPEG-TS → WebCodecs → OffscreenCanvas player</span>
         </header>
 
         <Player ref={player} onStatus={onStatus} />
@@ -85,14 +85,14 @@ export default function Home() {
               <span>
                 <strong>{v.snippet.title}</strong>
                 <small>{v.snippet.channelTitle}</small>
-                <em className="tag yt">YouTube player</em>
+                <em className="tag yt">YouTube · needs licensed source</em>
               </span>
             </button>
           ))}
         </section>
 
-        <h2>Authorized streams · canvas player</h2>
-        <p className="hint">These play through CanvasTube’s own engine: MPEG-TS → worker demux → WebCodecs → OffscreenCanvas + Web Audio. No &lt;video&gt; element, no iframe.</p>
+        <h2>Licensed & test streams</h2>
+        <p className="hint">Everything plays through CanvasTube’s own engine: MPEG-TS → worker demux → WebCodecs → OffscreenCanvas + Web Audio. No &lt;video&gt; element, no iframe.</p>
         <section className="results" data-testid="catalog">
           {catalog.map(a => (
             <button className={`result catalog ${selected === a.id ? 'selected' : ''}`} key={a.id} data-testid={`asset-${a.id}`}

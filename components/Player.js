@@ -1,6 +1,5 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import { CanvasEngine, canvasSupport } from '../lib/player/CanvasEngine.js';
-import { YouTubeEngine } from '../lib/player/YouTubeEngine.js';
 
 const fmt = s => {
   if (!Number.isFinite(s) || s < 0) return '0:00';
@@ -10,10 +9,10 @@ const fmt = s => {
 
 const INITIAL = { playing: false, buffering: false, loading: false, ended: false, current: 0, duration: null, bufferedFrom: 0, bufferedUntil: 0, error: null, audioLocked: false, clockMode: null };
 
-// One shell, two engines. The session's `player` field decides which engine renders.
+// Independent canvas player: MPEG-TS -> worker demux -> WebCodecs -> OffscreenCanvas + Web Audio.
 const Player = forwardRef(function Player({ onStatus }, ref) {
-  const shell = useRef(null), canvas = useRef(null), ytHost = useRef(null);
-  const engines = useRef({ canvas: null, youtube: null });
+  const shell = useRef(null), canvas = useRef(null);
+  const engines = useRef({ canvas: null });
   const active = useRef(null);
   const [kind, setKind] = useState(null);
   const [st, setSt] = useState(INITIAL);
@@ -40,10 +39,9 @@ const Player = forwardRef(function Player({ onStatus }, ref) {
     const sup = canvasSupport();
     setSupport(sup);
     if (sup.ok) engines.current.canvas = new CanvasEngine(canvas.current, emit('canvas'));
-    engines.current.youtube = new YouTubeEngine(ytHost.current, emit('youtube'));
     window.__canvasTube = { engines: engines.current, active: () => active.current };
     const e = engines.current;
-    return () => { e.canvas?.destroy(); e.youtube?.destroy(); };
+    return () => { e.canvas?.destroy(); };
   }, [emit]);
 
   const engine = () => engines.current[active.current];
@@ -52,12 +50,11 @@ const Player = forwardRef(function Player({ onStatus }, ref) {
     // Must be called synchronously inside the click handler so audio can be unlocked by the gesture.
     prepare() { engines.current.canvas?.unlockAudio(); },
     async play(session) {
-      const which = session.player === 'canvas' ? 'canvas' : 'youtube';
-      if (which === 'canvas' && !engines.current.canvas) {
+      const which = 'canvas';
+      if (!engines.current.canvas) {
         const msg = `This browser cannot run the canvas player (missing: ${support.missing?.join(', ')}).`;
         setSt({ ...INITIAL, error: msg }); onStatus?.(msg); return;
       }
-      for (const [k, e] of Object.entries(engines.current)) if (k !== which && e?.session) e.stop();
       active.current = which;
       setKind(which);
       setMeta({ title: session.title, notice: session.notice, player: session.player });
@@ -66,6 +63,8 @@ const Player = forwardRef(function Player({ onStatus }, ref) {
       await engine().load(session, { autoplay: true });
     },
     stop() { engine()?.stop(); active.current = null; setKind(null); setSt(INITIAL); },
+    // Shows a playback failure (e.g. no licensed media for a YouTube result) in the player surface.
+    fail(message, title) { engine()?.stop(); active.current = null; setKind('error'); setMeta({ title }); setSt({ ...INITIAL, error: message }); },
   }), [volume, muted, support, onStatus]);
 
   const toggle = useCallback(() => {
@@ -93,8 +92,7 @@ const Player = forwardRef(function Player({ onStatus }, ref) {
     return () => window.removeEventListener('keydown', onKey);
   }, [toggle, seekBy, toggleMute, fullscreen, changeVolume, volume]);
 
-  // Touch: tap toggles play, double-tap on the left/right third seeks ±10 s (canvas surface only;
-  // the YouTube iframe handles its own gestures).
+  // Touch: tap toggles play, double-tap on the left/right third seeks ±10 s.
   const onSurfacePointer = e => {
     if (kind !== 'canvas') return;
     const now = Date.now();
@@ -107,21 +105,20 @@ const Player = forwardRef(function Player({ onStatus }, ref) {
   const dur = st.duration || 0;
   const shown = scrub ?? st.current;
   const pct = v => (dur ? Math.max(0, Math.min(100, (v / dur) * 100)) : 0);
-  const badge = kind === 'canvas' ? 'Canvas · WebCodecs' : kind === 'youtube' ? 'YouTube IFrame Player' : null;
+  const badge = kind === 'canvas' ? 'Canvas · WebCodecs' : null;
 
   return (
     <div className="player-wrap">
       <div className={`player ${kind || 'idle'}`} ref={shell} data-testid="player" data-player={kind || 'none'}
         data-playing={String(st.playing)} data-buffering={String(st.buffering)} data-ended={String(st.ended)}>
         <canvas ref={canvas} className="surface" hidden={kind !== 'canvas'} aria-label="Video (canvas player)" data-testid="canvas" onPointerUp={onSurfacePointer} />
-        <div ref={ytHost} className="yt-host" hidden={kind !== 'youtube'} data-testid="yt-host" />
         {!kind && (
           <div className="overlay idle-msg">
-            <p>Search YouTube or pick an authorized stream below.</p>
-            {!support.ok && <p className="warn">Canvas player unavailable here: missing {support.missing?.join(', ')}. YouTube playback still works.</p>}
+            <p>Search YouTube or pick a stream below.</p>
+            {!support.ok && <p className="warn">Canvas player unavailable in this browser: missing {support.missing?.join(', ')}.</p>}
           </div>
         )}
-        {kind && (st.loading || st.buffering) && !st.error && <div className="overlay pointer-none" role="status" aria-live="polite"><div className="spinner" aria-hidden /><span className="sr-only">Buffering</span></div>}
+        {kind === 'canvas' && (st.loading || st.buffering) && !st.error && <div className="overlay pointer-none" role="status" aria-live="polite"><div className="spinner" aria-hidden /><span className="sr-only">Buffering</span></div>}
         {st.error && (
           <div className="overlay error" role="alert" data-testid="player-error">
             <strong>Can’t play this</strong><p>{st.error}</p>
@@ -130,7 +127,7 @@ const Player = forwardRef(function Player({ onStatus }, ref) {
         {badge && <span className={`badge ${kind}`} data-testid="player-badge">{badge}</span>}
       </div>
 
-      {kind && (
+      {kind === 'canvas' && (
         <div className="controls" role="group" aria-label="Playback controls">
           <button onClick={toggle} aria-label={st.playing && !st.ended ? 'Pause' : 'Play'} data-testid="btn-play">{st.playing && !st.ended ? '❚❚' : st.ended ? '↻' : '▶'}</button>
           <button onClick={() => seekBy(-10)} aria-label="Back 10 seconds">↶10</button>

@@ -34,26 +34,34 @@ function teardown() {
   s = null;
 }
 
-function open({ url, startTime = 0, seekTo = 0, hasAudio = false }) {
+function open({ url, startTime = 0, seekTo = 0, hasAudio = false, duration = null }) {
   teardown();
   const myGen = ++gen;
   clock = { mediaTime: seekTo, at: wallNow(), rate: 0 };
   s = {
-    gen: myGen, url, base: startTime * 1e6, target: seekTo, hasAudio,
+    gen: myGen, url, base: startTime * 1e6, target: seekTo, hasAudio, duration,
+    lastVideoIn: -Infinity, lastAudioIn: -Infinity, lastFrameOut: -Infinity, reconnects: 0,
     abort: new AbortController(),
     demuxer: null, videoDecoder: null, audioDecoder: null, videoConfig: null, audioConfig: null,
     pendingVideo: [], frames: [], needKey: true,
     demuxedUntil: seekTo, streamDone: false, flushed: false, readySent: false, ended: false,
     buffering: false, starvedSince: 0, lastFramePost: 0, lastPresented: -1,
-    stats: { decoded: 0, presented: 0, dropped: 0, prerollSkipped: 0, decoderRestarts: 0, audioChunks: 0, bytes: 0 },
+    stats: { lateSumMs: 0, lateMaxMs: 0, decoded: 0, presented: 0, dropped: 0, prerollSkipped: 0, decoderRestarts: 0, audioChunks: 0, bytes: 0 },
   };
   s.demuxer = new TSDemuxer({
     onTracks: t => { post('tracks', { video: t.video?.codec || null, audio: t.audio?.codec || null, unsupported: t.unsupported.map(u => u.codec) });
       if (!t.video) fail('Stream has no H.264 video track' + (t.unsupported.length ? ` (found ${t.unsupported.map(u => u.codec).join(', ')})` : ''), true); },
     onVideoConfig: c => configureVideo(c, myGen),
     onAudioConfig: c => configureAudio(c, myGen),
-    onVideo: v => { if (myGen === gen) { s.pendingVideo.push(v); noteDemuxed(v.timestamp); pump(); } },
-    onAudio: a => { if (myGen === gen) decodeAudio(a); },
+    onVideo: v => {
+      if (myGen !== gen) return;
+      // After a reconnect the new stream restarts at a keyframe at/before the cut: keep feeding the
+      // decoder from that keyframe, but decoded frames already shown are dropped in the output callback.
+      s.pendingVideo.push(v);
+      if (v.timestamp > s.lastVideoIn) { s.lastVideoIn = v.timestamp; noteDemuxed(v.timestamp); }
+      pump();
+    },
+    onAudio: a => { if (myGen === gen && a.timestamp > s.lastAudioIn) { s.lastAudioIn = a.timestamp; decodeAudio(a); } },
     onDiscontinuity: d => post('status', { text: `Stream discontinuity on PID ${d.pid} (${d.reason})` }),
   });
   read(myGen).catch(e => { if (myGen === gen && e.name !== 'AbortError') fail(`Network error: ${e.message}`, true); });
@@ -67,26 +75,29 @@ function noteDemuxed(tsUs) {
   if (t > s.demuxedUntil) { s.demuxedUntil = t; }
 }
 
+const MAX_RECONNECTS = 6;
+
+// Reads the stream; if the connection drops or ends before the known duration (network loss,
+// serverless time limits), reconnects at the last demuxed position. The server snaps to the
+// preceding keyframe and duplicate output is filtered by timestamp.
 async function read(myGen) {
-  const r = await fetch(s.url, { signal: s.abort.signal });
-  if (!r.ok) {
-    let msg = `Stream request failed (HTTP ${r.status})`;
-    try { const j = await r.json(); if (j.error) msg = j.error; } catch {}
-    return fail(msg, true);
-  }
-  post('status', { text: `Receiving MPEG-TS (${r.headers.get('X-Stream-Mode') || 'direct'})` });
-  const reader = r.body.getReader();
-  let lastBufferedPost = 0;
+  let url = s.url;
   for (;;) {
-    // Backpressure: stop pulling bytes while enough media is buffered; TCP flow control then pauses FFmpeg.
-    while (myGen === gen && (s.demuxedUntil - Math.max(mediaNow(), s.target) > MAX_AHEAD_S || s.pendingVideo.length > 400)) await sleep(50);
-    if (myGen !== gen) { reader.cancel().catch(() => {}); return; }
-    const { done, value } = await reader.read();
+    let result;
+    try { result = await readOnce(myGen, url); }
+    catch (e) { if (myGen !== gen || e.name === 'AbortError') return; result = { error: e }; }
+    if (myGen !== gen || result.fatal) return;
+    const incomplete = result.error || (s.duration && s.demuxedUntil < s.duration - 0.75);
+    if (!incomplete) break;
+    if (++s.reconnects > MAX_RECONNECTS) return fail(`Stream interrupted repeatedly${result.error ? `: ${result.error.message}` : ''}`, true);
+    post('status', { text: `Stream interrupted at ${s.demuxedUntil.toFixed(1)} s; reconnecting (${s.reconnects}/${MAX_RECONNECTS})` });
+    s.demuxer.emitPendingAU();
+    s.demuxer.reset();
+    await sleep(Math.min(4000, 250 * 2 ** (s.reconnects - 1)));
     if (myGen !== gen) return;
-    if (done) break;
-    s.stats.bytes += value.length;
-    s.demuxer.push(value);
-    if (performance.now() - lastBufferedPost > 250) { lastBufferedPost = performance.now(); post('buffered', { until: s.demuxedUntil }); }
+    const u = new URL(s.url, self.location.href);
+    u.searchParams.set('t', Math.max(0, s.demuxedUntil - 0.05).toFixed(3));
+    url = u.pathname + u.search;
   }
   s.demuxer.flush();
   s.streamDone = true;
@@ -94,8 +105,35 @@ async function read(myGen) {
   pump();
 }
 
+async function readOnce(myGen, url) {
+  const r = await fetch(url, { signal: s.abort.signal });
+  if (!r.ok) {
+    let msg = `Stream request failed (HTTP ${r.status})`;
+    try { const j = await r.json(); if (j.error) msg = j.error; } catch {}
+    if (r.status >= 500 && r.status !== 501 && s.reconnects < MAX_RECONNECTS) return { error: new Error(msg) };
+    fail(msg, true);
+    return { fatal: true };
+  }
+  post('status', { text: `Receiving MPEG-TS (${r.headers.get('X-Stream-Mode') || 'direct'})` });
+  const reader = r.body.getReader();
+  let lastBufferedPost = 0;
+  for (;;) {
+    // Backpressure: stop pulling bytes while enough media is buffered; TCP flow control then pauses FFmpeg.
+    while (myGen === gen && (s.demuxedUntil - Math.max(mediaNow(), s.target) > MAX_AHEAD_S || s.pendingVideo.length > 400)) await sleep(50);
+    if (myGen !== gen) { reader.cancel().catch(() => {}); return {}; }
+    const { done, value } = await reader.read();
+    if (myGen !== gen) return {};
+    if (done) return {};
+    s.stats.bytes += value.length;
+    s.demuxer.push(value);
+    if (performance.now() - lastBufferedPost > 250) { lastBufferedPost = performance.now(); post('buffered', { until: s.demuxedUntil }); }
+  }
+}
+
 async function configureVideo(c, myGen) {
   if (myGen !== gen) return;
+  const v = s.videoConfig;
+  if (v && v.codec === c.codec && v.codedWidth === c.width && v.codedHeight === c.height && s.videoDecoder?.state === 'configured') return; // same stream after reconnect
   if (typeof VideoDecoder === 'undefined') return fail('WebCodecs VideoDecoder is not available in this browser', true);
   const config = { codec: c.codec, codedWidth: c.width, codedHeight: c.height, optimizeForLatency: true };
   const support = await VideoDecoder.isConfigSupported(config).catch(e => ({ supported: false, error: e }));
@@ -116,7 +154,8 @@ function createVideoDecoder() {
       s.stats.decoded++;
       const t = (frame.timestamp - s.base) / 1e6;
       // Seek preroll: frames between the keyframe and the requested position are decoded but not shown.
-      if (t < s.target - 0.001) { s.stats.prerollSkipped++; frame.close(); return; }
+      if (t < s.target - 0.001 || frame.timestamp <= s.lastFrameOut) { s.stats.prerollSkipped++; frame.close(); return; }
+      s.lastFrameOut = frame.timestamp;
       s.frames.push(frame);
       if (s.frames.length > MAX_FRAMES * 2) { s.frames.shift().close(); s.stats.dropped++; }
     },
@@ -152,6 +191,8 @@ function pump() {
 
 async function configureAudio(c, myGen) {
   if (myGen !== gen) return;
+  const a = s.audioConfig;
+  if (a && a.codec === c.codec && a.sampleRate === c.sampleRate && a.numberOfChannels === c.numberOfChannels && s.audioDecoder?.state === 'configured') return;
   if (typeof AudioDecoder === 'undefined') { post('status', { text: 'AudioDecoder unavailable: playing video only' }); return; }
   const config = { codec: c.codec, sampleRate: c.sampleRate, numberOfChannels: c.numberOfChannels, description: c.description };
   const support = await AudioDecoder.isConfigSupported(config).catch(() => ({ supported: false }));
@@ -231,6 +272,9 @@ function render(myGen) {
       const f = frames.shift();
       draw(f);
       s.lastPresented = frameTime(f);
+      // Presentation error vs the (audio-master) clock: how late this frame hit the canvas.
+      const lateMs = (now - s.lastPresented) * 1000;
+      s.stats.lateSumMs += lateMs; s.stats.lateMaxMs = Math.max(s.stats.lateMaxMs, lateMs);
       f.close();
       s.stats.presented++;
       if (performance.now() - s.lastFramePost > 250) { s.lastFramePost = performance.now(); post('frame', { time: s.lastPresented }); post('stats', { stats: s.stats }); }

@@ -6,7 +6,6 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import http from 'node:http';
 import { chromium } from 'playwright';
-import { YT_STUB } from './youtube-stub.js';
 
 const PORT = 3217;
 const BASE = `http://localhost:${PORT}`;
@@ -17,8 +16,7 @@ const record = (name, player, outcome, note = '') => results.push({ name, player
 // Mock YouTube Data API v3 (no API key is available in this environment).
 const SEARCH_ITEMS = [
   { id: { videoId: 'aqz-KE-bpKQ' }, snippet: { title: 'Big Buck Bunny 60fps 4K', channelTitle: 'Blender', thumbnails: { medium: { url: '/favicon.ico' } } } },
-  { id: { videoId: 'NOEMBED0001' }, snippet: { title: 'Embedding disabled video', channelTitle: 'Test', thumbnails: { medium: { url: '/favicon.ico' } } } },
-  { id: { videoId: 'LICENSED001' }, snippet: { title: 'Operator-licensed video (canvas)', channelTitle: 'Test', thumbnails: { medium: { url: '/favicon.ico' } } } },
+  { id: { videoId: 'LICENSED001' }, snippet: { title: 'Operator-licensed video', channelTitle: 'Test', thumbnails: { medium: { url: '/favicon.ico' } } } },
 ];
 
 async function waitFor(fn, { timeout = 15000, interval = 100, msg = 'condition' } = {}) {
@@ -36,7 +34,9 @@ before(async () => {
   });
   await new Promise(r => mockApi.listen(0, '127.0.0.1', r));
   server = spawn('npx', ['next', 'start', '-p', String(PORT)], {
-    env: { ...process.env, YOUTUBE_API_KEY: 'e2e-test-key', YOUTUBE_API_BASE: `http://127.0.0.1:${mockApi.address().port}`, YOUTUBE_AUTHORIZED_MAP: 'LICENSED001=demo-av' },
+    env: { ...process.env, YOUTUBE_API_KEY: 'e2e-test-key', YOUTUBE_API_BASE: `http://127.0.0.1:${mockApi.address().port}`, YOUTUBE_AUTHORIZED_MAP: 'LICENSED001=demo-av',
+      // Cut every stream after 4 s so playback must survive reconnects (like serverless limits / flaky LTE).
+      MEDIA_MAX_STREAM_SECONDS: '4' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   server.stderr.on('data', d => process.stderr.write(d));
@@ -51,11 +51,13 @@ after(async () => {
   console.log('\nE2E_RESULTS ' + JSON.stringify(results));
 });
 
-async function newPage({ stubYouTube = true } = {}) {
+async function newPage() {
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
   page.errors = [];
   page.on('pageerror', e => page.errors.push(e.message));
-  if (stubYouTube) await page.route('https://www.youtube.com/iframe_api', r => r.fulfill({ contentType: 'text/javascript', body: YT_STUB }));
+  // Any attempt to reach YouTube's player or media hosts from the page is a test failure.
+  page.youtubeRequests = [];
+  page.on('request', r => { if (/youtube\.com|googlevideo\.com|ytimg\.com\/.*\.js/.test(r.url())) page.youtubeRequests.push(r.url()); });
   await page.goto(BASE);
   return page;
 }
@@ -121,8 +123,10 @@ test('canvas player: A/V fixture plays audio after a user gesture, stays in sync
   assert.ok(peak > 0.05, `no audible output (rms peak ${peak})`);
   // A/V sync: the presented video frame time vs the audio clock.
   await sleep(1500);
-  const sync = await page.evaluate(() => { const e = window.__canvasTube.engines.canvas; return { clock: e.currentTime(), frame: e.lastFrameTime }; });
-  assert.ok(Math.abs(sync.clock - sync.frame) < 0.3, `A/V offset ${sync.clock - sync.frame}`);
+  // Every presented frame records how late it was drawn relative to the audio clock.
+  const st1 = (await engineState(page)).stats;
+  const sync = { avgLateMs: st1.lateSumMs / st1.presented, maxLateMs: st1.lateMaxMs, dropped: st1.dropped };
+  assert.ok(sync.avgLateMs < 25, `average video lateness ${sync.avgLateMs} ms`);
   // Pause freezes clock and picture.
   await page.click('[data-testid=btn-play]');
   await sleep(300);
@@ -142,8 +146,8 @@ test('canvas player: A/V fixture plays audio after a user gesture, stays in sync
   for (let i = 0; i < 20; i++) { maxLevel = Math.max(maxLevel, (await engineState(page)).level); await sleep(50); }
   assert.ok(maxLevel < 0.001, `still audible at volume 0 (${maxLevel})`);
   assert.deepEqual(page.errors, []);
-  record('A/V fixture: audible after click, audio-master clock, A/V offset < 300 ms, pause/resume, volume 0', 'canvas', 'pass',
-    `rms peak=${peak.toFixed(3)} offset=${(sync.clock - sync.frame).toFixed(3)}s`);
+  record('A/V fixture: audible after click, audio-master clock, avg video lateness vs audio clock < 25 ms, pause/resume, volume 0', 'canvas', 'pass',
+    `rms peak=${peak.toFixed(3)} avgLate=${sync.avgLateMs.toFixed(1)}ms maxLate=${sync.maxLateMs.toFixed(1)}ms dropped=${sync.dropped}`);
   await page.close();
 });
 
@@ -168,68 +172,45 @@ test('canvas player: seek, repeated seeks do not leak streams, keyboard seek', a
   await page.close();
 });
 
-test('YouTube: search -> select -> official IFrame player controlled via API (stubbed youtube.com)', async () => {
+test('YouTube search -> licensed result plays in the canvas player; unlicensed result shows the limitation', async () => {
   const page = await newPage();
   await page.fill('[data-testid=search-input]', 'big buck bunny');
   await page.click('[data-testid=search-btn]');
   await page.locator('[data-testid=result]').first().waitFor();
-  assert.equal(await page.locator('[data-testid=result]').count(), 3);
+  assert.equal(await page.locator('[data-testid=result]').count(), 2);
+  // Unlicensed: clear error, no iframe, no request to YouTube.
   await page.locator('[data-testid=result]').first().click();
-  await waitFor(() => page.getAttribute('[data-testid=player]', 'data-player').then(v => v === 'youtube'));
-  await waitFor(() => page.getAttribute('[data-testid=player]', 'data-playing').then(v => v === 'true'));
-  assert.equal(await page.locator('[data-testid=yt-host] iframe').count(), 1);
-  await page.click('[data-testid=btn-play]'); // pause
-  await page.locator('[data-testid=volume]').fill('0.5');
-  await page.locator('body').press('ArrowRight');
-  const calls = await page.evaluate(() => window.__ytCalls);
-  const names = calls.map(c => c[0]);
-  assert.deepEqual(calls[0].slice(0, 2), ['new', 'aqz-KE-bpKQ']);
-  for (const n of ['playVideo', 'pauseVideo', 'setVolume', 'seekTo']) assert.ok(names.includes(n), `${n} not called: ${names}`);
-  assert.ok(calls.some(c => c[0] === 'setVolume' && c[1] === 50));
-  assert.match(await page.textContent('[data-testid=player-notice]'), /official YouTube player/);
-  assert.deepEqual(page.errors, []);
-  record('Search (mock Data API) -> select -> IFrame player: play/pause/volume/seek commands', 'youtube-iframe (stubbed)', 'pass', names.join(','));
-  // Embedding disabled -> clear error
-  await page.locator('[data-testid=result]').nth(1).click();
   await page.locator('[data-testid=player-error]').waitFor();
-  assert.match(await page.textContent('[data-testid=player-error]'), /does not allow this video to be played in embedded players/);
-  record('Embedding-disabled video shows a clear error (YT error 150)', 'youtube-iframe (stubbed)', 'pass');
-  // Operator-licensed mapping -> canvas player with real media bytes
-  await page.locator('[data-testid=result]').nth(2).click();
+  assert.match(await page.textContent('[data-testid=player-error]'), /No licensed media source/);
+  record('Search (mock Data API) -> unlicensed result -> clear "no licensed media source" error', 'canvas', 'pass');
+  // Licensed mapping: plays through /api/youtube/stream/:id -> canvas.
+  await page.locator('[data-testid=result]').nth(1).click();
   await waitFor(() => page.getAttribute('[data-testid=player]', 'data-player').then(v => v === 'canvas'));
   await waitFor(async () => (await engineState(page)).running, { msg: 'licensed canvas playback' });
-  assert.equal(await page.locator('[data-testid=yt-host] iframe').count(), 0, 'iframe should be torn down when switching players');
-  record('YouTube id mapped to licensed asset (YOUTUBE_AUTHORIZED_MAP) plays in canvas player', 'canvas', 'pass');
+  const a = await canvasPixels(page); await sleep(600); const b = await canvasPixels(page);
+  assert.notEqual(a.hash, b.hash);
+  assert.equal(await page.locator('video, iframe').count(), 0);
+  assert.deepEqual(page.youtubeRequests, []);
+  assert.deepEqual(page.errors, []);
+  record('Search -> licensed YouTube id -> /api/youtube/stream -> canvas frames + audio', 'canvas', 'pass');
   await page.close();
 });
 
-test('YouTube: pasted link plays without search', async () => {
+test('pasted YouTube link resolves through the same session flow', async () => {
   const page = await newPage();
-  await page.fill('[data-testid=search-input]', 'https://youtu.be/aqz-KE-bpKQ?si=abc');
+  await page.fill('[data-testid=search-input]', 'https://youtu.be/LICENSED001?si=abc');
   await page.click('[data-testid=search-btn]');
-  await waitFor(() => page.getAttribute('[data-testid=player]', 'data-player').then(v => v === 'youtube'));
-  const calls = await page.evaluate(() => window.__ytCalls);
-  assert.deepEqual(calls[0].slice(0, 2), ['new', 'aqz-KE-bpKQ']);
-  record('Pasted youtu.be link opens IFrame player', 'youtube-iframe (stubbed)', 'pass');
+  await waitFor(async () => (await engineState(page)).running, { msg: 'pasted link playback' });
+  await page.fill('[data-testid=search-input]', 'https://www.youtube.com/watch?v=aqz-KE-bpKQ');
+  await page.click('[data-testid=search-btn]');
+  await page.locator('[data-testid=player-error]').waitFor();
+  record('Pasted link: licensed id plays on canvas; unlicensed id shows limitation', 'canvas', 'pass');
   await page.close();
 });
 
-test('errors: unreachable youtube.com and missing API key are reported to the user', async () => {
-  const page = await newPage({ stubYouTube: false });
-  await page.route('https://www.youtube.com/**', r => r.abort('internetdisconnected'));
-  await page.fill('[data-testid=search-input]', 'aqz-KE-bpKQ');
-  await page.click('[data-testid=search-btn]');
-  await page.locator('[data-testid=player-error]').waitFor({ timeout: 20000 });
-  assert.match(await page.textContent('[data-testid=player-error]'), /Could not load the YouTube IFrame API/);
-  record('youtube.com blocked -> clear error', 'youtube-iframe', 'pass');
-  await page.close();
+test('errors: missing API key and unlicensed stream route', async () => {
   const r = await fetch(`${BASE}/api/youtube/stream/aqz-KE-bpKQ`);
   assert.equal(r.status, 501);
   assert.equal((await r.json()).code, 'no_authorized_media');
   record('/api/youtube/stream for unlicensed id -> 501 no_authorized_media', 'n/a', 'pass');
-});
-
-test('real YouTube reachability (informational)', async () => {
-  const ok = await fetch('https://www.youtube.com/iframe_api', { signal: AbortSignal.timeout(8000) }).then(r => r.ok, () => false);
-  record('Real youtube.com IFrame playback', 'youtube-iframe', ok ? 'reachable (not asserted)' : 'NOT RUN: youtube.com unreachable from this environment');
 });
