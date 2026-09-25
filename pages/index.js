@@ -69,6 +69,13 @@ export default function Home() {
         <Player ref={player} onStatus={onStatus} />
         <div className="status" role="status" aria-live="polite" data-testid="status">{status}</div>
 
+        <div style={{ marginBottom: '1rem' }}>
+          <button onClick={() => start({ kind: 'catalog', id: 'demo' }, 'Demo video')} data-testid="demo-btn" style={{ padding: '0.5rem 1rem', fontSize: '1rem', marginRight: '0.5rem' }}>
+            ▶ Play demo
+          </button>
+          <span style={{ color: '#999', fontSize: '0.9rem' }}>5s test pattern (H.264 MPEG-TS, canvas-only)</span>
+        </div>
+
         <form onSubmit={search} role="search">
           <input value={q} onChange={e => setQ(e.target.value)} placeholder="Search YouTube or paste a YouTube link" aria-label="Search YouTube or paste a YouTube link" maxLength={100} data-testid="search-input" />
           <button disabled={searching} data-testid="search-btn">{searching ? 'Searching…' : 'Search'}</button>
