@@ -3,8 +3,10 @@ FROM node:18-bullseye
 WORKDIR /app
 COPY package.json package-lock.json ./
 
-# Install Python before npm (needed for native module builds)
-RUN apt-get update && apt-get install -y python3 && rm -rf /var/lib/apt/lists/*
+# Install Python + build tools for npm
+RUN apt-get update && \
+    apt-get install -y python3 build-essential && \
+    rm -rf /var/lib/apt/lists/*
 
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 RUN npm ci
@@ -14,8 +16,12 @@ RUN npm run build && npm prune --omit=dev
 FROM node:18-bullseye
 WORKDIR /app
 
-# Install FFmpeg + Python for runtime
-RUN apt-get update && apt-get install -y ffmpeg python3 && rm -rf /var/lib/apt/lists/*
+# Install runtime dependencies separately
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    ffmpeg \
+    python3 && \
+    rm -rf /var/lib/apt/lists/*
 
 COPY --from=0 /app/node_modules ./node_modules
 COPY --from=0 /app/.next ./.next
