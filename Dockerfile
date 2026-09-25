@@ -3,9 +3,9 @@ FROM node:18-bookworm
 WORKDIR /app
 COPY package.json package-lock.json ./
 
-# Install Python + build tools for npm
+# Install Python + build tools for npm (python-is-python3 creates python -> python3 symlink)
 RUN apt-get update && \
-    apt-get install -y python3 build-essential && \
+    apt-get install -y python-is-python3 build-essential && \
     rm -rf /var/lib/apt/lists/*
 
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
@@ -18,7 +18,7 @@ WORKDIR /app
 
 # Install runtime dependencies
 RUN apt-get update && \
-    apt-get install -y ffmpeg && \
+    apt-get install -y python-is-python3 ffmpeg && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=0 /app/node_modules ./node_modules
