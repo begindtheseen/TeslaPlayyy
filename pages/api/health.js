@@ -1,5 +1,5 @@
 // GET /api/health -> server capabilities (no secrets).
-import { ffmpegAvailable, activeProcesses } from '../../lib/server/ffmpeg.js';
+import { ffmpegAvailable, ffmpegError, activeProcesses } from '../../lib/server/ffmpeg.js';
 import { sessionCount } from '../../lib/server/sessions.js';
 
 export default function handler(req, res) {
@@ -7,6 +7,7 @@ export default function handler(req, res) {
   res.status(200).json({
     ok: true,
     ffmpeg: ffmpegAvailable(),
+    ffmpegError: ffmpegError(),
     youtubeSearch: !!key && key !== 'your_key_here',
     sessions: sessionCount(),
     activeStreams: activeProcesses().size,

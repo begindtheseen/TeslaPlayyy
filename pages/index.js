@@ -85,7 +85,7 @@ export default function Home() {
               <span>
                 <strong>{v.snippet.title}</strong>
                 <small>{v.snippet.channelTitle}</small>
-                <em className="tag yt">YouTube · needs licensed source</em>
+                <em className="tag yt">YouTube</em>
               </span>
             </button>
           ))}
