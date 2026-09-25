@@ -35,8 +35,8 @@ before(async () => {
   await new Promise(r => mockApi.listen(0, '127.0.0.1', r));
   server = spawn('npx', ['next', 'start', '-p', String(PORT)], {
     env: { ...process.env, YOUTUBE_API_KEY: 'e2e-test-key', YOUTUBE_API_BASE: `http://127.0.0.1:${mockApi.address().port}`, YOUTUBE_AUTHORIZED_MAP: 'LICENSED001=demo-av',
-      // Cut every stream after 4 s so playback must survive reconnects (like serverless limits / flaky LTE).
-      MEDIA_MAX_STREAM_SECONDS: '4' },
+      // Cut every stream after 2 s so playback must survive reconnects (like serverless limits / flaky LTE).
+      MEDIA_MAX_STREAM_SECONDS: '2' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   server.stderr.on('data', d => process.stderr.write(d));
@@ -106,7 +106,7 @@ test('canvas player: bundled video-only demo renders moving frames and ends', as
   const st = await engineState(page);
   assert.ok(st.stats.presented > 90, `presented ${st.stats.presented}`);
   assert.deepEqual(page.errors, []);
-  record('Demo (video-only) plays, frames change, reaches end', 'canvas', 'pass', `presented=${st.stats.presented} dropped=${st.stats.dropped}`);
+  record('Demo (video-only) plays, frames change, reaches end', 'canvas', 'pass', `presented=${st.stats.presented} dropped=${st.stats.dropped} reconnects=${st.stats.reconnects}`);
   await page.close();
 });
 
@@ -145,9 +145,15 @@ test('canvas player: A/V fixture plays audio after a user gesture, stays in sync
   let maxLevel = 0;
   for (let i = 0; i < 20; i++) { maxLevel = Math.max(maxLevel, (await engineState(page)).level); await sleep(50); }
   assert.ok(maxLevel < 0.001, `still audible at volume 0 (${maxLevel})`);
+  // Play through to the end across forced stream cuts: every frame must still be shown exactly once.
+  await waitFor(() => page.getAttribute('[data-testid=player]', 'data-ended').then(v => v === 'true'), { timeout: 20000, msg: 'ended' });
+  const fin = (await engineState(page)).stats;
+  assert.ok(fin.reconnects >= 1, 'expected at least one forced reconnect');
+  assert.ok(fin.presented + fin.dropped >= 235 && fin.presented + fin.dropped <= 240, `frames shown+dropped ${fin.presented}+${fin.dropped}`);
+  sync.reconnects = fin.reconnects; sync.presented = fin.presented;
   assert.deepEqual(page.errors, []);
-  record('A/V fixture: audible after click, audio-master clock, avg video lateness vs audio clock < 25 ms, pause/resume, volume 0', 'canvas', 'pass',
-    `rms peak=${peak.toFixed(3)} avgLate=${sync.avgLateMs.toFixed(1)}ms maxLate=${sync.maxLateMs.toFixed(1)}ms dropped=${sync.dropped}`);
+  record('A/V fixture: audible after click, audio-master clock, avg video lateness vs audio clock < 25 ms, pause/resume, volume 0, plays to end across forced reconnects', 'canvas', 'pass',
+    `rms peak=${peak.toFixed(3)} avgLate=${sync.avgLateMs.toFixed(1)}ms maxLate=${sync.maxLateMs.toFixed(1)}ms dropped=${sync.dropped} presented=${sync.presented} reconnects=${sync.reconnects}`);
   await page.close();
 });
 

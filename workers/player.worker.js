@@ -46,7 +46,7 @@ function open({ url, startTime = 0, seekTo = 0, hasAudio = false, duration = nul
     pendingVideo: [], frames: [], needKey: true,
     demuxedUntil: seekTo, streamDone: false, flushed: false, readySent: false, ended: false,
     buffering: false, starvedSince: 0, lastFramePost: 0, lastPresented: -1,
-    stats: { lateSumMs: 0, lateMaxMs: 0, decoded: 0, presented: 0, dropped: 0, prerollSkipped: 0, decoderRestarts: 0, audioChunks: 0, bytes: 0 },
+    stats: { reconnects: 0, lateSumMs: 0, lateMaxMs: 0, decoded: 0, presented: 0, dropped: 0, prerollSkipped: 0, decoderRestarts: 0, audioChunks: 0, bytes: 0 },
   };
   s.demuxer = new TSDemuxer({
     onTracks: t => { post('tracks', { video: t.video?.codec || null, audio: t.audio?.codec || null, unsupported: t.unsupported.map(u => u.codec) });
@@ -89,6 +89,7 @@ async function read(myGen) {
     if (myGen !== gen || result.fatal) return;
     const incomplete = result.error || (s.duration && s.demuxedUntil < s.duration - 0.75);
     if (!incomplete) break;
+    s.stats.reconnects = s.reconnects + 1;
     if (++s.reconnects > MAX_RECONNECTS) return fail(`Stream interrupted repeatedly${result.error ? `: ${result.error.message}` : ''}`, true);
     post('status', { text: `Stream interrupted at ${s.demuxedUntil.toFixed(1)} s; reconnecting (${s.reconnects}/${MAX_RECONNECTS})` });
     s.demuxer.emitPendingAU();
