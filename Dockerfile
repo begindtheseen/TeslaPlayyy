@@ -1,32 +1,16 @@
-FROM node:18-bookworm
-
+# Production image: Next.js + FFmpeg (required for MPEG-TS streaming and seeking).
+FROM node:22-bookworm-slim AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
-
-# Install Python + build tools for npm (python-is-python3 creates python -> python3 symlink)
-RUN apt-get update && \
-    apt-get install -y python-is-python3 build-essential && \
-    rm -rf /var/lib/apt/lists/*
-
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 RUN npm ci
 COPY . .
 RUN npm run build && npm prune --omit=dev
 
-FROM node:18-bookworm
+FROM node:22-bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg python3 yt-dlp && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-
-# Install runtime dependencies
-RUN apt-get update && \
-    apt-get install -y python-is-python3 ffmpeg && \
-    rm -rf /var/lib/apt/lists/*
-
-COPY --from=0 /app/node_modules ./node_modules
-COPY --from=0 /app/.next ./.next
-COPY --from=0 /app/public ./public
-COPY --from=0 /app/lib ./lib
-COPY --from=0 /app/pages ./pages
-COPY package.json ./
-
+ENV NODE_ENV=production PORT=3000
+COPY --from=build /app ./
 EXPOSE 3000
-CMD ["npm", "start"]
+CMD ["sh", "-c", "npx next start -p ${PORT}"]
