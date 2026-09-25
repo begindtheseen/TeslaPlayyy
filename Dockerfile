@@ -1,4 +1,4 @@
-FROM node:18-bullseye
+FROM node:18-bookworm
 
 WORKDIR /app
 COPY package.json package-lock.json ./
@@ -13,14 +13,12 @@ RUN npm ci
 COPY . .
 RUN npm run build && npm prune --omit=dev
 
-FROM node:18-bullseye
+FROM node:18-bookworm
 WORKDIR /app
 
-# Install runtime dependencies separately
+# Install runtime dependencies
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-    ffmpeg \
-    python3 && \
+    apt-get install -y ffmpeg && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=0 /app/node_modules ./node_modules
