@@ -1,11 +1,10 @@
-export default async function handler(req,res){
-  const q=String(req.query.query||'').trim();
-  if(!q)return res.status(400).json({error:'Missing query'});
-  const key=process.env.YOUTUBE_API_KEY;
-  if(!key)return res.status(500).json({error:'YOUTUBE_API_KEY is not configured'});
-  const u=new URL('https://www.googleapis.com/youtube/v3/search');
-  u.searchParams.set('part','snippet');u.searchParams.set('q',q);u.searchParams.set('type','video');u.searchParams.set('maxResults','12');u.searchParams.set('key',key);
-  const r=await fetch(u);const d=await r.json();
-  if(!r.ok)return res.status(r.status).json({error:d?.error?.message||'YouTube API error'});
-  res.status(200).json(d);
+// GET /api/youtube/search?query=... -> metadata only (YouTube Data API v3 search.list, 100 quota units).
+import { search, sendYouTubeError } from '../../../lib/server/youtube.js';
+import { rateLimit } from '../../../lib/server/rateLimit.js';
+
+export default async function handler(req, res) {
+  if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
+  if (!rateLimit(req, res, { name: 'search', limit: 30, windowMs: 60e3 })) return;
+  try { res.status(200).json(await search(req.query.query)); }
+  catch (e) { sendYouTubeError(res, e); }
 }
