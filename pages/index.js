@@ -1,11 +1,112 @@
-import {useEffect,useRef,useState,forwardRef,useImperativeHandle} from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import Head from 'next/head';
+import Player from '../components/Player.js';
+import { parseYouTubeInput } from '../lib/youtubeUrl.js';
 
-const Player=forwardRef(function Player({onStatus},ref){
- const canvas=useRef(null),worker=useRef(null);const [playing,setPlaying]=useState(false);
- useEffect(()=>{const w=new Worker(new URL('../workers/player.worker.js',import.meta.url));worker.current=w;w.onmessage=e=>{if(e.data.type==='status')onStatus(e.data.text);if(e.data.type==='playing')setPlaying(e.data.value);if(e.data.type==='error')onStatus('Player error: '+e.data.message)};const c=canvas.current;if(c?.transferControlToOffscreen){const off=c.transferControlToOffscreen();w.postMessage({type:'init',canvas:off},[off])}else onStatus('OffscreenCanvas is unavailable in this browser.');return()=>w.terminate()},[onStatus]);
- useImperativeHandle(ref,()=>({async load(id){const r=await fetch('/api/playback/session?videoId='+encodeURIComponent(id));const d=await r.json();if(!r.ok)return onStatus(d.error);wPost({type:'open',url:d.streamUrl})}}));
- const wPost=m=>worker.current?.postMessage(m);
- return <div className="player"><canvas ref={canvas}/><div className="controls"><button onClick={()=>wPost({type:playing?'pause':'resume'})}>{playing?'❚❚':'▶'}</button><button onClick={()=>wPost({type:'seek',seconds:-10})}>↶10</button><button onClick={()=>wPost({type:'seek',seconds:10})}>10↷</button></div></div>
-});
-export default function Home(){const[q,setQ]=useState(''),[items,setItems]=useState([]),[status,setStatus]=useState('Ready'),player=useRef(null);async function search(e){e.preventDefault();if(!q.trim())return;setStatus('Searching…');const r=await fetch('/api/youtube/search?query='+encodeURIComponent(q));const d=await r.json();setItems(d.items||[]);setStatus(d.error||`${(d.items||[]).length} results`) }function demo(){setStatus("Loading local MPEG-TS demo…");player.current?.load("demo")}function choose(v){setStatus('YouTube search is metadata-only until an authorized media provider is connected.');player.current?.load(v.id.videoId)}return <><Head><title>CanvasTube</title><meta name="viewport" content="width=device-width,initial-scale=1"/></Head><main><header><b>CanvasTube</b><span>custom canvas media prototype</span></header><Player ref={player} onStatus={setStatus}/><div style={{padding:"12px 0"}}><button onClick={demo} style={{padding:"12px 20px",background:"#e82127",color:"white",border:0,borderRadius:8,cursor:"pointer"}}>▶ Play local demo (no API key)</button></div><form onSubmit={search}><input value={q} onChange={e=>setQ(e.target.value)} placeholder="Search YouTube"/><button>Search</button></form><div className="status">{status}</div><section>{items.map(v=><button className="result" key={v.id.videoId} onClick={()=>choose(v)}><img src={v.snippet.thumbnails.medium.url}/><span><strong>{v.snippet.title}</strong><small>{v.snippet.channelTitle}</small></span></button>)}</section></main></>}
+async function createSession(source) {
+  const r = await fetch('/api/playback/session', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source }) });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || `Session request failed (${r.status})`);
+  return d;
+}
+
+export default function Home() {
+  const [q, setQ] = useState('');
+  const [items, setItems] = useState([]);
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState(null);
+  const [catalog, setCatalog] = useState([]);
+  const [status, setStatus] = useState('Ready');
+  const [selected, setSelected] = useState(null);
+  const player = useRef(null);
+
+  useEffect(() => {
+    fetch('/api/media/catalog').then(r => r.json()).then(d => setCatalog(d.items || [])).catch(() => {});
+  }, []);
+
+  const onStatus = useCallback(t => setStatus(t), []);
+
+  async function start(source, label) {
+    player.current?.prepare(); // unlock Web Audio inside the user gesture
+    setSelected(source.kind === 'youtube' ? source.videoId : source.id);
+    setStatus(`Opening ${label}…`);
+    try {
+      const s = await createSession(source);
+      setStatus(s.player === 'canvas' ? 'Streaming MPEG-TS into the canvas player' : 'Playing through the official YouTube player');
+      await player.current?.play(s);
+    } catch (e) { setStatus(e.message); }
+  }
+
+  async function search(e) {
+    e.preventDefault();
+    if (!q.trim()) return;
+    // A pasted YouTube link or id plays immediately (no API key needed).
+    const id = parseYouTubeInput(q);
+    if (id) return start({ kind: 'youtube', videoId: id, prefer: 'canvas' }, 'YouTube video');
+    setSearching(true); setSearchError(null); setStatus('Searching…');
+    try {
+      const r = await fetch('/api/youtube/search?query=' + encodeURIComponent(q.trim()));
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.error || `Search failed (${r.status})`);
+      setItems(d.items || []);
+      setStatus(`${(d.items || []).length} results`);
+    } catch (err) { setItems([]); setSearchError(err.message); setStatus(err.message); }
+    finally { setSearching(false); }
+  }
+
+  return (
+    <>
+      <Head>
+        <title>CanvasTube</title>
+        <meta name="viewport" content="width=device-width,initial-scale=1" />
+      </Head>
+      <main>
+        <header>
+          <b>CanvasTube</b>
+          <span>YouTube search · official YouTube player · custom WebCodecs canvas player for authorized streams</span>
+        </header>
+
+        <Player ref={player} onStatus={onStatus} />
+        <div className="status" role="status" aria-live="polite" data-testid="status">{status}</div>
+
+        <form onSubmit={search} role="search">
+          <input value={q} onChange={e => setQ(e.target.value)} placeholder="Search YouTube or paste a YouTube link" aria-label="Search YouTube or paste a YouTube link" maxLength={100} data-testid="search-input" />
+          <button disabled={searching} data-testid="search-btn">{searching ? 'Searching…' : 'Search'}</button>
+        </form>
+
+        {searchError && <div className="notice error" role="alert" data-testid="search-error">{searchError}{/API key|quota/i.test(searchError) && <><br />You can still paste any YouTube link above to play it.</>}</div>}
+
+        <section className="results" aria-busy={searching} data-testid="results">
+          {searching && Array.from({ length: 6 }, (_, i) => <div key={i} className="result skeleton" aria-hidden />)}
+          {!searching && items.map(v => (
+            <button className={`result ${selected === v.id.videoId ? 'selected' : ''}`} key={v.id.videoId} data-testid="result"
+              onClick={() => start({ kind: 'youtube', videoId: v.id.videoId, title: v.snippet.title, prefer: 'canvas' }, v.snippet.title)}>
+              <img src={v.snippet.thumbnails.medium.url} alt="" loading="lazy" />
+              <span>
+                <strong>{v.snippet.title}</strong>
+                <small>{v.snippet.channelTitle}</small>
+                <em className="tag yt">YouTube player</em>
+              </span>
+            </button>
+          ))}
+        </section>
+
+        <h2>Authorized streams · canvas player</h2>
+        <p className="hint">These play through CanvasTube’s own engine: MPEG-TS → worker demux → WebCodecs → OffscreenCanvas + Web Audio. No &lt;video&gt; element, no iframe.</p>
+        <section className="results" data-testid="catalog">
+          {catalog.map(a => (
+            <button className={`result catalog ${selected === a.id ? 'selected' : ''}`} key={a.id} data-testid={`asset-${a.id}`}
+              onClick={() => start({ kind: 'catalog', id: a.id }, a.title)}>
+              <span className="thumb" aria-hidden>▶</span>
+              <span>
+                <strong>{a.title}</strong>
+                {a.license && <small>{a.license}</small>}
+                <em className="tag canvas">Canvas player</em>
+              </span>
+            </button>
+          ))}
+        </section>
+      </main>
+    </>
+  );
+}

@@ -1,19 +1,261 @@
-// Original, minimal MPEG-TS -> H.264 Annex B -> WebCodecs -> OffscreenCanvas demo.
-// Intentionally video-only. PAT/PMT, PES, frame boundaries and production A/V sync
-// need hardening before this is used with arbitrary live streams.
-let ctx, decoder, playing = true, stopped = false, videoPid = -1;
-let packetBytes = new Uint8Array(0), pesParts = [], pesLength = 0;
-let frames = [], lastPts = 0, clockStart = 0, firstPts = null, rendering = false;
-const emit = (type, extra = {}) => postMessage({ type, ...extra });
-const concat = (a,b) => {const o=new Uint8Array(a.length+b.length);o.set(a);o.set(b,a.length);return o};
-const join = parts => {let n=parts.reduce((s,p)=>s+p.length,0),o=new Uint8Array(n),i=0;for(const p of parts){o.set(p,i);i+=p.length}return o};
-const pts = p => ((p[0]&14)*536870912)+(p[1]<<22)+((p[2]&254)<<14)+(p[3]<<7)+(p[4]>>1);
-function parsePAT(p){let i=1+p[0];if(i+8>=p.length||p[i]!==0)return -1;let end=i+3+(((p[i+1]&15)<<8)|p[i+2])-4;i+=8;while(i+4<=end){let prog=(p[i]<<8)|p[i+1],pid=((p[i+2]&31)<<8)|p[i+3];if(prog)return pid;i+=4}return -1}
-let pmtPid=-1;
-function parsePMT(p){let i=1+p[0];if(i+12>=p.length||p[i]!==2)return;let end=i+3+(((p[i+1]&15)<<8)|p[i+2])-4;let info=((p[i+10]&15)<<8)|p[i+11];i+=12+info;while(i+5<=end){let type=p[i],pid=((p[i+1]&31)<<8)|p[i+2],len=((p[i+3]&15)<<8)|p[i+4];if(type===0x1b){videoPid=pid;emit('status',{text:'H.264 video PID: '+pid});return}i+=5+len}}
-function nalUnits(bytes){let starts=[];for(let i=0;i+3<bytes.length;i++){if(bytes[i]===0&&bytes[i+1]===0&&(bytes[i+2]===1||(bytes[i+2]===0&&bytes[i+3]===1))){starts.push(i);i+=bytes[i+2]===1?2:3}}return starts.map((s,j)=>bytes.subarray(s,starts[j+1]??bytes.length))}
-function flushPES(){if(!pesParts.length||!decoder)return;let b=join(pesParts);pesParts=[];pesLength=0;if(b.length<14||b[0]!==0||b[1]!==0||b[2]!==1)return;let header=9+b[8],t=(b[7]&0x80)?pts(b.subarray(9,14))/90:lastPts+41667;lastPts=t;let payload=b.subarray(header);let nals=nalUnits(payload),key=nals.some(n=>{let k=n[2]===1?3:4;return (n[k]&31)===5});if(!nals.length)return;try{decoder.decode(new EncodedVideoChunk({type:key?'key':'delta',timestamp:Math.round(t),data:payload}))}catch(e){emit('error',{message:'Decode failed: '+e.message})}}
-function parseTS(bytes){packetBytes=concat(packetBytes,bytes);let off=0;while(off+188<=packetBytes.length){if(packetBytes[off]!==0x47){off++;continue}let p=packetBytes.subarray(off,off+188);off+=188;if(p[1]&0x80)continue;let start=!!(p[1]&0x40),pid=((p[1]&31)<<8)|p[2],control=(p[3]>>4)&3;if(!(control&1))continue;let i=4;if(control&2){i+=1+p[i]}if(i>=188)continue;let payload=p.subarray(i);if(pid===0&&start){let found=parsePAT(payload);if(found>=0)pmtPid=found}else if(pid===pmtPid&&start)parsePMT(payload);else if(pid===videoPid){if(start)flushPES();pesParts.push(payload);pesLength+=payload.length}}packetBytes=packetBytes.slice(off)}
-function draw(){if(rendering||!playing||!ctx)return;rendering=true;function step(){if(!playing){rendering=false;return}if(frames.length){let f=frames.shift();if(firstPts===null){firstPts=f.timestamp;clockStart=performance.now()}let due=clockStart+(f.timestamp-firstPts)/1000;if(performance.now()+3>=due){ctx.canvas.width=f.displayWidth;ctx.canvas.height=f.displayHeight;ctx.drawImage(f,0,0);f.close()}else frames.unshift(f)}setTimeout(step,8)}step()}
-async function open(url){stopped=false;videoPid=-1;pmtPid=-1;packetBytes=new Uint8Array(0);pesParts=[];frames.forEach(f=>f.close());frames=[];firstPts=null;lastPts=0;decoder?.close();if(!('VideoDecoder' in self))throw Error('WebCodecs VideoDecoder unavailable');decoder=new VideoDecoder({output:f=>{frames.push(f);if(frames.length>40)frames.shift().close();draw()},error:e=>emit('error',{message:e.message})});decoder.configure({codec:'avc1.42E01E',optimizeForLatency:true});let r=await fetch(url);if(!r.ok||!r.body)throw Error('Stream HTTP '+r.status);emit('status',{text:'Receiving MPEG-TS stream'});let reader=r.body.getReader();while(!stopped){let {done,value}=await reader.read();if(done)break;parseTS(value)}flushPES();await decoder.flush();emit('status',{text:'Stream complete'});draw()}
-self.onmessage=e=>{let m=e.data;try{if(m.type==='init'){ctx=m.canvas.getContext('2d');emit('status',{text:'Canvas initialized'})}if(m.type==='open')open(m.url).catch(err=>emit('error',{message:String(err)}));if(m.type==='pause'){playing=false;emit('playing',{value:false})}if(m.type==='resume'){playing=true;emit('playing',{value:true});draw()}if(m.type==='stop'){stopped=true;playing=false;frames.forEach(f=>f.close());frames=[]}if(m.type==='seek')emit('status',{text:'Seeking is a Phase 2 task; requested '+m.seconds+'s'})}catch(err){emit('error',{message:String(err)})}};
+// Canvas playback worker: fetch MPEG-TS -> TSDemuxer -> VideoDecoder -> OffscreenCanvas,
+//                                               \-> AudioDecoder -> PCM posted to the main thread (Web Audio).
+// The main thread owns the media clock (audio-master) and posts it here; this worker only presents
+// video frames whose timestamp is due on that clock.
+//
+// Main -> worker: init{canvas} open{url,startTime,seekTo,hasAudio} clock{mediaTime,at,rate} stop
+// Worker -> main: status tracks videoConfig audioConfig audio{time,duration,sampleRate,planes} buffered{until}
+//                 ready{time} buffering{value} frame{time} ended stats error{message,fatal}
+import { TSDemuxer } from '../lib/ts/demuxer.js';
+
+const MAX_AHEAD_S = 8;        // stop reading the network once this much media is demuxed ahead of the clock
+const MAX_DECODE_QUEUE = 8;   // encoded chunks inside VideoDecoder
+const MAX_FRAMES = 12;        // decoded VideoFrames held (each can pin a GPU/video buffer)
+const MAX_DECODER_RESTARTS = 5;
+
+let ctx = null;
+let gen = 0;                  // generation counter; bumps on open/seek/stop to ignore stale async work
+let s = null;                 // per-load state
+let clock = { mediaTime: 0, at: 0, rate: 0 };
+
+const post = (type, extra = {}, transfer) => postMessage({ type, gen, ...extra }, transfer || []);
+const wallNow = () => performance.timeOrigin + performance.now();
+const mediaNow = () => clock.mediaTime + (clock.rate ? (wallNow() - clock.at) / 1000 : 0);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const raf = typeof requestAnimationFrame === 'function' ? cb => requestAnimationFrame(cb) : cb => setTimeout(cb, 10);
+
+function teardown() {
+  if (!s) return;
+  s.abort.abort();
+  for (const f of s.frames) f.close();
+  s.frames = [];
+  s.pendingVideo = [];
+  for (const d of [s.videoDecoder, s.audioDecoder]) { try { if (d && d.state !== 'closed') d.close(); } catch {} }
+  s = null;
+}
+
+function open({ url, startTime = 0, seekTo = 0, hasAudio = false }) {
+  teardown();
+  const myGen = ++gen;
+  clock = { mediaTime: seekTo, at: wallNow(), rate: 0 };
+  s = {
+    gen: myGen, url, base: startTime * 1e6, target: seekTo, hasAudio,
+    abort: new AbortController(),
+    demuxer: null, videoDecoder: null, audioDecoder: null, videoConfig: null, audioConfig: null,
+    pendingVideo: [], frames: [], needKey: true,
+    demuxedUntil: seekTo, streamDone: false, flushed: false, readySent: false, ended: false,
+    buffering: false, starvedSince: 0, lastFramePost: 0, lastPresented: -1,
+    stats: { decoded: 0, presented: 0, dropped: 0, prerollSkipped: 0, decoderRestarts: 0, audioChunks: 0, bytes: 0 },
+  };
+  s.demuxer = new TSDemuxer({
+    onTracks: t => { post('tracks', { video: t.video?.codec || null, audio: t.audio?.codec || null, unsupported: t.unsupported.map(u => u.codec) });
+      if (!t.video) fail('Stream has no H.264 video track' + (t.unsupported.length ? ` (found ${t.unsupported.map(u => u.codec).join(', ')})` : ''), true); },
+    onVideoConfig: c => configureVideo(c, myGen),
+    onAudioConfig: c => configureAudio(c, myGen),
+    onVideo: v => { if (myGen === gen) { s.pendingVideo.push(v); noteDemuxed(v.timestamp); pump(); } },
+    onAudio: a => { if (myGen === gen) decodeAudio(a); },
+    onDiscontinuity: d => post('status', { text: `Stream discontinuity on PID ${d.pid} (${d.reason})` }),
+  });
+  read(myGen).catch(e => { if (myGen === gen && e.name !== 'AbortError') fail(`Network error: ${e.message}`, true); });
+  raf(() => render(myGen));
+}
+
+function fail(message, fatal = false) { post('error', { message, fatal }); if (fatal && s) s.abort.abort(); }
+
+function noteDemuxed(tsUs) {
+  const t = (tsUs - s.base) / 1e6;
+  if (t > s.demuxedUntil) { s.demuxedUntil = t; }
+}
+
+async function read(myGen) {
+  const r = await fetch(s.url, { signal: s.abort.signal });
+  if (!r.ok) {
+    let msg = `Stream request failed (HTTP ${r.status})`;
+    try { const j = await r.json(); if (j.error) msg = j.error; } catch {}
+    return fail(msg, true);
+  }
+  post('status', { text: `Receiving MPEG-TS (${r.headers.get('X-Stream-Mode') || 'direct'})` });
+  const reader = r.body.getReader();
+  let lastBufferedPost = 0;
+  for (;;) {
+    // Backpressure: stop pulling bytes while enough media is buffered; TCP flow control then pauses FFmpeg.
+    while (myGen === gen && (s.demuxedUntil - Math.max(mediaNow(), s.target) > MAX_AHEAD_S || s.pendingVideo.length > 400)) await sleep(50);
+    if (myGen !== gen) { reader.cancel().catch(() => {}); return; }
+    const { done, value } = await reader.read();
+    if (myGen !== gen) return;
+    if (done) break;
+    s.stats.bytes += value.length;
+    s.demuxer.push(value);
+    if (performance.now() - lastBufferedPost > 250) { lastBufferedPost = performance.now(); post('buffered', { until: s.demuxedUntil }); }
+  }
+  s.demuxer.flush();
+  s.streamDone = true;
+  post('buffered', { until: s.demuxedUntil, complete: true });
+  pump();
+}
+
+async function configureVideo(c, myGen) {
+  if (myGen !== gen) return;
+  if (typeof VideoDecoder === 'undefined') return fail('WebCodecs VideoDecoder is not available in this browser', true);
+  const config = { codec: c.codec, codedWidth: c.width, codedHeight: c.height, optimizeForLatency: true };
+  const support = await VideoDecoder.isConfigSupported(config).catch(e => ({ supported: false, error: e }));
+  if (myGen !== gen) return;
+  if (!support.supported) return fail(`This browser cannot decode ${c.codec} (${c.width}x${c.height}) with WebCodecs`, true);
+  s.videoConfig = config;
+  if (ctx) { ctx.canvas.width = c.width; ctx.canvas.height = c.height; }
+  post('videoConfig', { codec: c.codec, width: c.width, height: c.height });
+  createVideoDecoder();
+}
+
+function createVideoDecoder() {
+  const myGen = gen;
+  try { if (s.videoDecoder && s.videoDecoder.state !== 'closed') s.videoDecoder.close(); } catch {}
+  s.videoDecoder = new VideoDecoder({
+    output: frame => {
+      if (myGen !== gen || !s) { frame.close(); return; }
+      s.stats.decoded++;
+      const t = (frame.timestamp - s.base) / 1e6;
+      // Seek preroll: frames between the keyframe and the requested position are decoded but not shown.
+      if (t < s.target - 0.001) { s.stats.prerollSkipped++; frame.close(); return; }
+      s.frames.push(frame);
+      if (s.frames.length > MAX_FRAMES * 2) { s.frames.shift().close(); s.stats.dropped++; }
+    },
+    error: e => {
+      if (myGen !== gen || !s) return;
+      s.stats.decoderRestarts++;
+      if (s.stats.decoderRestarts > MAX_DECODER_RESTARTS) return fail(`Video decoder failed repeatedly: ${e.message}`, true);
+      post('status', { text: `Video decoder error (${e.message}); restarting at next keyframe` });
+      createVideoDecoder();
+    },
+  });
+  s.videoDecoder.addEventListener?.('dequeue', pump);
+  s.videoDecoder.configure(s.videoConfig);
+  s.needKey = true;
+  pump();
+}
+
+function pump() {
+  if (!s || !s.videoDecoder || s.videoDecoder.state !== 'configured') return;
+  const d = s.videoDecoder;
+  while (s.pendingVideo.length && d.decodeQueueSize < MAX_DECODE_QUEUE && s.frames.length < MAX_FRAMES) {
+    const v = s.pendingVideo.shift();
+    if (s.needKey) { if (v.type !== 'key') continue; s.needKey = false; }
+    try { d.decode(new EncodedVideoChunk({ type: v.type, timestamp: v.timestamp, duration: v.duration, data: v.data })); }
+    catch (e) { s.needKey = true; post('status', { text: `Dropped undecodable chunk: ${e.message}` }); }
+  }
+  if (s.streamDone && !s.pendingVideo.length && !s.flushed && d.decodeQueueSize === 0) {
+    s.flushed = true;
+    const myGen = gen;
+    d.flush().then(() => { if (myGen === gen && s) s.decoderDrained = true; }, () => { if (myGen === gen && s) s.decoderDrained = true; });
+  }
+}
+
+async function configureAudio(c, myGen) {
+  if (myGen !== gen) return;
+  if (typeof AudioDecoder === 'undefined') { post('status', { text: 'AudioDecoder unavailable: playing video only' }); return; }
+  const config = { codec: c.codec, sampleRate: c.sampleRate, numberOfChannels: c.numberOfChannels, description: c.description };
+  const support = await AudioDecoder.isConfigSupported(config).catch(() => ({ supported: false }));
+  if (myGen !== gen) return;
+  if (!support.supported) { post('status', { text: `Audio codec ${c.codec} unsupported: playing video only` }); return; }
+  s.audioConfig = config;
+  post('audioConfig', { codec: c.codec, sampleRate: c.sampleRate, channels: c.numberOfChannels });
+  createAudioDecoder();
+}
+
+function createAudioDecoder() {
+  const myGen = gen;
+  try { if (s.audioDecoder && s.audioDecoder.state !== 'closed') s.audioDecoder.close(); } catch {}
+  s.audioDecoder = new AudioDecoder({
+    output: data => {
+      if (myGen !== gen || !s) { data.close(); return; }
+      const time = (data.timestamp - s.base) / 1e6;
+      const duration = data.numberOfFrames / data.sampleRate;
+      if (time + duration <= s.target) { data.close(); return; } // seek preroll
+      const planes = [];
+      for (let ch = 0; ch < data.numberOfChannels; ch++) {
+        const p = new Float32Array(data.numberOfFrames);
+        data.copyTo(p, { planeIndex: ch, format: 'f32-planar' });
+        planes.push(p);
+      }
+      const sampleRate = data.sampleRate;
+      data.close();
+      s.stats.audioChunks++;
+      post('audio', { time, duration, sampleRate, planes }, planes.map(p => p.buffer));
+    },
+    error: e => {
+      if (myGen !== gen || !s) return;
+      post('status', { text: `Audio decoder error (${e.message}); restarting` });
+      if (++s.stats.decoderRestarts <= MAX_DECODER_RESTARTS) createAudioDecoder();
+    },
+  });
+  s.audioDecoder.configure(s.audioConfig);
+}
+
+function decodeAudio(a) {
+  noteDemuxed(a.timestamp);
+  const d = s.audioDecoder;
+  if (!d || d.state !== 'configured') return;
+  try { d.decode(new EncodedAudioChunk({ type: 'key', timestamp: a.timestamp, duration: a.duration, data: a.data })); }
+  catch (e) { post('status', { text: `Dropped audio chunk: ${e.message}` }); }
+}
+
+const frameTime = f => (f.timestamp - s.base) / 1e6;
+
+function draw(frame) {
+  if (!ctx) return;
+  if (ctx.canvas.width !== frame.displayWidth || ctx.canvas.height !== frame.displayHeight) {
+    ctx.canvas.width = frame.displayWidth; ctx.canvas.height = frame.displayHeight;
+  }
+  ctx.drawImage(frame, 0, 0, ctx.canvas.width, ctx.canvas.height);
+}
+
+function render(myGen) {
+  if (myGen !== gen || !s) return;
+  pump();
+  const frames = s.frames;
+  if (!s.readySent) {
+    // Show the first frame at/after the target as a poster; the main thread starts the clock on 'ready'.
+    const audioReady = !s.hasAudio || !s.audioConfig || s.stats.audioChunks > 5 || s.streamDone;
+    if (frames.length && audioReady) {
+      draw(frames[0]);
+      s.readySent = true;
+      post('ready', { time: frameTime(frames[0]) });
+    } else if (s.streamDone && s.decoderDrained && !frames.length) {
+      s.readySent = true; s.ended = true; post('ended', { reason: 'no-frames' });
+    }
+  } else if (clock.rate) {
+    const now = mediaNow();
+    // Drop frames that are already late (a newer frame is also due).
+    while (frames.length > 1 && frameTime(frames[1]) <= now) { frames.shift().close(); s.stats.dropped++; }
+    if (frames.length && frameTime(frames[0]) <= now + 0.004) {
+      const f = frames.shift();
+      draw(f);
+      s.lastPresented = frameTime(f);
+      f.close();
+      s.stats.presented++;
+      if (performance.now() - s.lastFramePost > 250) { s.lastFramePost = performance.now(); post('frame', { time: s.lastPresented }); post('stats', { stats: s.stats }); }
+    }
+    const drained = s.streamDone && !s.pendingVideo.length && s.decoderDrained && !frames.length;
+    if (drained && !s.ended) { s.ended = true; post('frame', { time: s.lastPresented }); post('stats', { stats: s.stats }); post('ended', { time: s.lastPresented }); }
+    // Starvation: nothing decoded to show and the network has not finished.
+    const starving = !frames.length && !drained && !s.streamDone;
+    if (starving && !s.starvedSince) s.starvedSince = performance.now();
+    if (!starving) s.starvedSince = 0;
+    const buffering = starving && performance.now() - s.starvedSince > 120;
+    if (buffering !== s.buffering) { s.buffering = buffering; post('buffering', { value: buffering }); }
+    else if (s.buffering && frames.length >= 3) { s.buffering = false; post('buffering', { value: false }); }
+  }
+  raf(() => render(myGen));
+}
+
+self.onmessage = e => {
+  const m = e.data;
+  try {
+    switch (m.type) {
+      case 'init': ctx = m.canvas.getContext('2d', { alpha: false, desynchronized: true }); ctx.fillStyle = '#000'; ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height); break;
+      case 'open': open(m); break;
+      case 'clock': if (m.gen === gen) clock = { mediaTime: m.mediaTime, at: m.at, rate: m.rate }; break;
+      case 'stop': gen++; teardown(); break;
+    }
+  } catch (err) { fail(String(err?.message || err), true); }
+};

@@ -6,7 +6,7 @@
     "build": "next build",
     "start": "next start",
     "test": "node --test test/*.test.js",
-    "test:e2e": "node test/e2e/run-e2e.js",
+    "test:e2e": "node --test --test-concurrency=1 test/e2e/*.e2e.js",
     "fixtures": "bash scripts/generate-fixtures.sh"
   },
   "dependencies": {
