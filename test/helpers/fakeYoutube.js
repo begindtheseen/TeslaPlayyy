@@ -12,7 +12,7 @@ export const FAKE_YTDLP = fileURLToPath(new URL('../fixtures/fake-yt-dlp.mjs', i
 // maxRangeBytes mimics googlevideo refusing oversized range requests (it returns 403).
 export async function startFakeCdn({ maxRangeBytes = Infinity } = {}) {
   const { dir, files } = ensureDashFixture();
-  const cdn = { requests: [], open: 0, maxRangeBytes, dir, files };
+  const cdn = { requests: [], open: 0, maxRangeBytes, dir, files, fail403: 0 };
   cdn.server = http.createServer((req, res) => {
     const u = new URL(req.url, 'http://x');
     const file = path.join(dir, path.basename(u.searchParams.get('f') || ''));
@@ -21,6 +21,7 @@ export async function startFakeCdn({ maxRangeBytes = Infinity } = {}) {
     res.on('close', () => { cdn.open--; });
     if (u.pathname !== '/videoplayback') { res.statusCode = 404; return res.end(); }
     if (Number(u.searchParams.get('expire')) * 1000 < Date.now()) { res.statusCode = 403; return res.end('expired'); }
+    if (cdn.fail403 > 0) { cdn.fail403--; res.statusCode = 403; return res.end('ip mismatch'); } // e.g. URL used from another IP
     let size;
     try { size = statSync(file).size; } catch { res.statusCode = 404; return res.end(); }
     const m = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || '');
