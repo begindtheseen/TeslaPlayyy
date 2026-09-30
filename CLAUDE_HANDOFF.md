@@ -16,15 +16,25 @@ A polished, touch-friendly YouTube-style search UI and a custom playback engine:
 8. Add tests, run them, run npm run build, document exact results and remaining limitations. Produce a concise changelog.
 
 ## Constraints
-- No iframe, no HTML video element in the custom demo playback path.
+- No iframe, no HTML video element in the custom playback path (demo, catalog and YouTube alike).
 - OffscreenCanvas + WebCodecs worker decode for video; Web Audio for audio.
 - Do not copy TeslaPlay's proprietary code, endpoints, assets or branding.
-- No speculative YouTube extraction implementation, credential theft, DRM circumvention, or unsafe driving-mode bypass.
-- Preserve an independently testable demo with no API keys.
+- YouTube playback (added at the repository owner's direction) uses server-side yt-dlp extraction for
+  **public videos only**: no login/cookies, no credential handling, no age-gate/region/members/DRM
+  bypass. Those return clean 403/404/451 errors. No unsafe driving-mode bypass.
+- Preserve an independently testable demo with no API keys, and the fake yt-dlp/CDN test harness.
 - If a capability is unavailable in the test environment, report it explicitly; don't silently replace it with an iframe and call it equivalent.
+
+## Current state (YouTube backend)
+- `lib/server/ytdlp.js` extraction, `egress.js` proxies/rotation, `formats.js` format and delivery
+  choice, `cdnRelay.js` range proxy, `loopbackRelay.js` FFmpeg inputs, `youtubeStream.js` routes.
+- `lib/mp4/fmp4.js` DASH demuxer used by the worker's dual path; `lib/player/platform.js` probe.
+- Tests replace YouTube with `test/helpers/fakeYoutube.js` + `test/fixtures/fake-yt-dlp.mjs`.
+- Not yet done: verification against live YouTube from a real deployment, and on a Tesla MCU.
+  See README "Limits" and docs/RESILIENCE.md.
 
 ## Engineering standards
 Make small working commits per phase. Prefer explicit data contracts and modular parser tests over giant React components. Track decoder lifecycle, stream abort, bounded frame queues and timestamp units carefully (WebCodecs uses microseconds). Explain any browser/codec assumptions. After each phase: what changed, exact commands run, tests passed/failed, what remains.
 
 ## Final acceptance
-A fresh clone can npm install && npm run dev and play the bundled demo via custom canvas, without credentials. A separate authorized A/V fixture plays with sound, pause and seek. YouTube search works with a valid API key. YouTube result playback is clearly gated until the user supplies a legally authorized streaming backend. No unverified claims about Tesla browser compatibility.
+A fresh clone can npm install && npm run dev and play the bundled demo via custom canvas, without credentials. A pasted public YouTube link plays through the canvas pipeline with synced audio, pause and seek (muxed and dual delivery). Search works with or without an API key. No unverified claims about Tesla browser compatibility.

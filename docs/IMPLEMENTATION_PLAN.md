@@ -31,3 +31,13 @@
 - Audio plays in sync on an authorized A/V fixture; pause/resume/seek work after long playback.
 - No unhandled worker errors, leaked VideoFrames or hanging fetches.
 - Tests and npm run build pass, and unsupported browsers show a clear fallback.
+
+## YouTube backend (done in this iteration; see README)
+- [x] yt-dlp extraction with client fallbacks, caching, error classification (`/api/extract`)
+- [x] Range-aware googlevideo proxy (`/api/stream`), chunked upstream, abort, URL refresh, drop resume
+- [x] Server-side `-c copy` remux to MPEG-TS (`/api/muxed`) for Intel MCUs
+- [x] Worker dual-DASH path (fMP4 demuxer, sidx seeking); delivery chosen by a client GPU probe
+- [x] Rebuffer deadlock fix, render-loop watchdog, decoder leak tracking
+- [x] Egress proxies / source addresses / IPv6 prefix / rotation hooks; `/api/health` success rate
+- [ ] Verify against live YouTube from a deployed server; monitor success rate by client
+- [ ] Verify on a stationary Tesla (MCU2 Intel and MCU3 AMD); tune the default quality per MCU
