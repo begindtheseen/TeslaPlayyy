@@ -59,6 +59,12 @@ paste link ─▶ POST /api/playback/session ─▶ yt-dlp (android_vr,web_safar
 
 Details: `docs/BACKEND_CONTRACT.md`. Rate limits, IP rotation and proxies: `docs/RESILIENCE.md`.
 
+## Deploy
+
+`HCLOUD_TOKEN=... npm run deploy:hetzner -- up` creates a Hetzner Cloud server that installs itself
+(Docker, Caddy HTTPS, IPv6 rotation, daily yt-dlp refresh). See `docs/DEPLOY.md`. Vercel cannot run
+the YouTube path (no yt-dlp/ffmpeg, request time limits); only the demo works there.
+
 ## Tests
 
 ```bash

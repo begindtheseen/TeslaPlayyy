@@ -1,0 +1,8 @@
+# HTTPS is required: WebCodecs and OffscreenCanvas only work in a secure context.
+# DOMAIN comes from .env.production (a real domain, or <ip-with-dashes>.sslip.io by default).
+{$DOMAIN} {
+	reverse_proxy 127.0.0.1:3000 {
+		# Stream media as it arrives (MPEG-TS / byte ranges); never buffer whole responses.
+		flush_interval -1
+	}
+}

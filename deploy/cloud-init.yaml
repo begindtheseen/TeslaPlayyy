@@ -1,0 +1,83 @@
+#cloud-config
+# First-boot setup for a fresh Ubuntu 24.04 Hetzner Cloud server. scripts/deploy-hetzner.mjs fills in
+# the double-underscore placeholders. Progress log: /var/log/canvastube-setup.log
+package_update: true
+packages: [git, ca-certificates, curl, python3]
+
+write_files:
+  - path: /etc/sysctl.d/99-canvastube.conf
+    content: |
+      # Allow binding any address of the routed IPv6 /64 (random source address per extraction).
+      net.ipv6.ip_nonlocal_bind = 1
+
+  - path: /usr/local/bin/canvastube-anyip
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      # Route the server's whole IPv6 /64 to lo ("AnyIP") and record it for the app.
+      set -e
+      ADDR=$(ip -6 -o addr show scope global | awk '{print $4; exit}')
+      [ -n "$ADDR" ] || { echo "no global IPv6 address"; exit 0; }
+      NET=$(python3 -c "import ipaddress,sys; print(ipaddress.ip_interface(sys.argv[1]).network)" "$ADDR")
+      ip -6 route replace local "$NET" dev lo
+      sed -i '/^EGRESS_IPV6_PREFIX=/d' /opt/canvastube/.env.production 2>/dev/null || true
+      # Only enable rotation if a random address in the prefix really works end to end (the prefix
+      # must be routed to this server; an on-link-only prefix would silently drop replies).
+      TEST=$(python3 -c "import ipaddress,random,sys; n=ipaddress.ip_network(sys.argv[1]); print(n[random.randrange(2**32, n.num_addresses - 1)])" "$NET")
+      if curl -6 -sS -m 15 --interface "$TEST" -o /dev/null -w '%{http_code}' https://www.youtube.com/generate_204 | grep -q '^204$'; then
+        echo "EGRESS_IPV6_PREFIX=$NET" >> /opt/canvastube/.env.production
+        echo "IPv6 rotation enabled for $NET (tested from $TEST)"
+      else
+        ip -6 route del local "$NET" dev lo || true
+        echo "IPv6 rotation NOT enabled: test request from $TEST failed; using the default address"
+      fi
+
+  - path: /etc/systemd/system/canvastube-anyip.service
+    content: |
+      [Unit]
+      Description=CanvasTube IPv6 AnyIP route
+      After=network-online.target
+      Wants=network-online.target
+      Before=docker.service
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/canvastube-anyip
+      RemainAfterExit=yes
+      [Install]
+      WantedBy=multi-user.target
+
+  # Daily 04:15 UTC: restart the app so it pip-upgrades yt-dlp. Sundays: also pull + rebuild.
+  - path: /etc/systemd/system/canvastube-refresh.service
+    content: |
+      [Unit]
+      Description=CanvasTube refresh (yt-dlp update / weekly rebuild)
+      [Service]
+      Type=oneshot
+      WorkingDirectory=/opt/canvastube
+      ExecStart=/bin/sh -c 'if [ "$(date +%%u)" = 7 ]; then git pull --ff-only && docker compose -f deploy/docker-compose.yml up -d --build; else docker compose -f deploy/docker-compose.yml restart app; fi'
+  - path: /etc/systemd/system/canvastube-refresh.timer
+    content: |
+      [Unit]
+      Description=CanvasTube daily refresh
+      [Timer]
+      OnCalendar=*-*-* 04:15:00 UTC
+      Persistent=true
+      [Install]
+      WantedBy=timers.target
+
+runcmd:
+  - exec > /var/log/canvastube-setup.log 2>&1
+  - set -x
+  - sysctl --system
+  - curl -fsSL https://get.docker.com | sh
+  - git clone --branch __BRANCH__ --depth 1 __REPO__ /opt/canvastube
+  - |
+    IP4=$(curl -fsS http://169.254.169.254/hetzner/v1/metadata/public-ipv4)
+    DOMAIN="__DOMAIN__"
+    [ -n "$DOMAIN" ] || DOMAIN="$(echo "$IP4" | tr . -).sslip.io"
+    printf 'DOMAIN=%s\n' "$DOMAIN" > /opt/canvastube/.env.production
+    printf '%s\n' "__EXTRA_ENV_B64__" | base64 -d >> /opt/canvastube/.env.production
+  - systemctl daemon-reload
+  - systemctl enable --now canvastube-anyip.service canvastube-refresh.timer
+  - cd /opt/canvastube && docker compose -f deploy/docker-compose.yml up -d --build
+  - echo CANVASTUBE_SETUP_DONE
