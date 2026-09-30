@@ -10,12 +10,17 @@
     "fixtures": "bash scripts/generate-fixtures.sh"
   },
   "dependencies": {
+    "https-proxy-agent": "^7.0.6",
     "next": "14.2.32",
     "react": "18.3.1",
-    "react-dom": "18.3.1"
+    "react-dom": "18.3.1",
+    "socks-proxy-agent": "^8.0.5"
   },
   "devDependencies": {
-    "playwright": "^1.56.1"
+    "@types/node": "^22.20.4",
+    "@types/react": "^18.3.31",
+    "playwright": "^1.56.1",
+    "typescript": "^5.9.3"
   },
   "type": "module",
   "engines": {
