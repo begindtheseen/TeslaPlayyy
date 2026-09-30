@@ -7,6 +7,15 @@ const fmt = s => {
   return (h ? `${h}:${String(m).padStart(2, '0')}` : `${m}`) + `:${String(x).padStart(2, '0')}`;
 };
 
+// Headlines for server error codes (see lib/server/ytdlp.js). Messages come from the server.
+const ERROR_TITLES = {
+  private: 'Private video', unavailable: 'Video unavailable', age_restricted: 'Age-restricted video',
+  region_blocked: 'Not available in this region', members_only: 'Members-only video', drm_protected: 'Protected video',
+  live_unsupported: 'Live stream', upcoming: 'Not premiered yet', blocked: 'YouTube is rate-limiting the server',
+  network: 'Can’t reach YouTube', timeout: 'YouTube took too long', no_formats: 'No playable formats',
+  extractor_missing: 'Server is missing yt-dlp', ffmpeg_unavailable: 'Server is missing FFmpeg',
+};
+
 const INITIAL = { playing: false, buffering: false, loading: false, ended: false, current: 0, duration: null, bufferedFrom: 0, bufferedUntil: 0, error: null, audioLocked: false, clockMode: null };
 
 // Independent canvas player: MPEG-TS -> worker demux -> WebCodecs -> OffscreenCanvas + Web Audio.
@@ -49,7 +58,7 @@ const Player = forwardRef(function Player({ onStatus }, ref) {
   useImperativeHandle(ref, () => ({
     // Must be called synchronously inside the click handler so audio can be unlocked by the gesture.
     prepare() { engines.current.canvas?.unlockAudio(); },
-    async play(session) {
+    async play(session, { startAt = 0 } = {}) {
       const which = 'canvas';
       if (!engines.current.canvas) {
         const msg = `This browser cannot run the canvas player (missing: ${support.missing?.join(', ')}).`;
@@ -60,11 +69,14 @@ const Player = forwardRef(function Player({ onStatus }, ref) {
       setMeta({ title: session.title, notice: session.notice, player: session.player });
       setSt({ ...INITIAL, loading: true, playing: true, duration: session.canvas?.duration ?? null });
       engine().setVolume(volume); engine().setMuted(muted);
-      await engine().load(session, { autoplay: true });
+      await engine().load(session, { autoplay: true, startAt });
     },
     stop() { engine()?.stop(); active.current = null; setKind(null); setSt(INITIAL); },
-    // Shows a playback failure (e.g. no licensed media for a YouTube result) in the player surface.
-    fail(message, title) { engine()?.stop(); active.current = null; setKind('error'); setMeta({ title }); setSt({ ...INITIAL, error: message }); },
+    currentTime() { return engine()?.currentTime?.() ?? 0; },
+    // Shows a playback failure (private, age-gated, region-locked, blocked...) in the player surface.
+    fail(message, title, { code = null, onRetry = null } = {}) {
+      engine()?.stop(); active.current = null; setKind('error'); setMeta({ title, onRetry }); setSt({ ...INITIAL, error: message, errorCode: code });
+    },
   }), [volume, muted, support, onStatus]);
 
   const toggle = useCallback(() => {
@@ -121,7 +133,8 @@ const Player = forwardRef(function Player({ onStatus }, ref) {
         {kind === 'canvas' && (st.loading || st.buffering) && !st.error && <div className="overlay pointer-none" role="status" aria-live="polite"><div className="spinner" aria-hidden /><span className="sr-only">Buffering</span></div>}
         {st.error && (
           <div className="overlay error" role="alert" data-testid="player-error">
-            <strong>Can’t play this</strong><p>{st.error}</p>
+            <strong data-testid="error-title">{ERROR_TITLES[st.errorCode] || 'Can’t play this'}</strong><p>{st.error}</p>
+            {meta.onRetry && <button className="retry" onClick={meta.onRetry} data-testid="btn-retry">Try again</button>}
           </div>
         )}
         {badge && <span className={`badge ${kind}`} data-testid="player-badge">{badge}</span>}

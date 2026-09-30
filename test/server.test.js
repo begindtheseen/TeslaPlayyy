@@ -11,6 +11,7 @@ import { activeProcesses, ffmpegAvailable, planSeek } from '../lib/server/ffmpeg
 import { closeSession, getSession, touchSession } from '../lib/server/sessions.js';
 import { assertFetchableUrl, isPrivateAddress } from '../lib/server/urlGuard.js';
 import { search, info, validateQuery, parseIsoDuration, YouTubeError } from '../lib/server/youtube.js';
+import { startFakeCdn, fakeYoutubeEnv } from './helpers/fakeYoutube.js';
 
 const HAS_FFMPEG = ffmpegAvailable();
 let server, base, originServer, originBase;
@@ -67,9 +68,27 @@ test('session: catalog asset resolves to the canvas player with probed codecs', 
   assert.ok(s.heartbeatIntervalMs >= 5000);
 });
 
-test('session: YouTube video without a licensed source is refused (no iframe fallback)', async () => {
-  await assert.rejects(createPlaybackSession({ kind: 'youtube', videoId: 'aqz-KE-bpKQ' }),
-    e => e instanceof PlaybackError && e.status === 409 && e.code === 'no_authorized_media' && e.extra.videoId === 'aqz-KE-bpKQ');
+test('session: YouTube id resolves to the muxed or dual canvas delivery via yt-dlp (fake extractor)', { skip: !HAS_FFMPEG }, async () => {
+  const cdn = await startFakeCdn();
+  const saved = { ...process.env };
+  Object.assign(process.env, fakeYoutubeEnv(cdn));
+  try {
+    const intel = await createPlaybackSession({ kind: 'youtube', videoId: 'dQw4w9WgXcQ', intel: '1' });
+    assert.equal(intel.player, 'canvas');
+    assert.equal(intel.canvas.delivery, 'muxed');
+    assert.match(intel.canvas.streamUrl, /^\/api\/muxed\/dQw4w9WgXcQ\?session=/);
+    assert.deepEqual([intel.canvas.hasAudio, intel.canvas.startTime, intel.canvas.duration, intel.canvas.seekable], [true, 0, 36, true]);
+    assert.equal(intel.title, 'Fake video dQw4w9WgXcQ');
+    const dual = await createPlaybackSession({ kind: 'youtube', videoId: 'dQw4w9WgXcQ', delivery: 'dual' });
+    assert.equal(dual.canvas.delivery, 'dual');
+    assert.match(dual.canvas.tracks.video.url, /^\/api\/stream\/dQw4w9WgXcQ\?itag=134&session=/);
+    assert.match(dual.canvas.tracks.audio.url, /^\/api\/stream\/dQw4w9WgXcQ\?itag=140&session=/);
+    assert.equal(getSession(dual.sessionId).plan.video, '134');
+    const tesla = await createPlaybackSession({ kind: 'youtube', videoId: 'dQw4w9WgXcQ' }, { userAgent: 'Mozilla/5.0 (X11; Linux x86_64) Chrome/136.0 Safari/537.36 Tesla/2025.20' });
+    assert.equal(tesla.canvas.delivery, 'muxed', 'auto on a Tesla UA -> muxed');
+    await assert.rejects(createPlaybackSession({ kind: 'youtube', videoId: 'AGEGATED000' }), e => e instanceof PlaybackError && e.status === 403 && e.code === 'age_restricted' && e.extra.videoId === 'AGEGATED000');
+    await assert.rejects(createPlaybackSession({ kind: 'youtube', videoId: 'PRIVATEVID0' }), e => e.status === 404 && e.code === 'private');
+  } finally { process.env = saved; await cdn.close(); }
 });
 
 test('session: operator-mapped YouTube id streams its licensed copy via /api/youtube/stream to the canvas player', { skip: !HAS_FFMPEG }, async () => {
@@ -219,7 +238,13 @@ test('YouTube search: validation, missing key, quota mapping and response shapin
   assert.throws(() => validateQuery('   '), e => e.code === 'missing_query');
   assert.throws(() => validateQuery('x'.repeat(101)), e => e.code === 'query_too_long');
   delete process.env.YOUTUBE_API_KEY;
-  await assert.rejects(search('cats'), e => e instanceof YouTubeError && e.status === 503 && e.code === 'missing_api_key');
+  // Without a key, search falls back to the public results page (ytInitialData).
+  const page = `<script>var ytInitialData = ${JSON.stringify({ contents: { twoColumnSearchResultsRenderer: { primaryContents: { sectionListRenderer: { contents: [{ itemSectionRenderer: { contents: [
+    { videoRenderer: { videoId: 'aqz-KE-bpKQ', title: { runs: [{ text: 'Big Buck Bunny' }] }, longBylineText: { runs: [{ text: 'Blender' }] }, thumbnail: { thumbnails: [{ url: 'https://i.ytimg.com/x.jpg' }] } } },
+    { adSlotRenderer: {} }] } }] } } } } })};</script>`;
+  const scraped = await search('cats scraper', { fetchImpl: async () => new Response(page, { status: 200 }) });
+  assert.deepEqual(scraped.items.map(i => [i.id.videoId, i.snippet.title, i.snippet.channelTitle]), [['aqz-KE-bpKQ', 'Big Buck Bunny', 'Blender']]);
+  await assert.rejects(search('cats broken', { fetchImpl: async () => new Response('<html>', { status: 200 }) }), e => e instanceof YouTubeError && e.code === 'scrape_failed');
   process.env.YOUTUBE_API_KEY = 'test-key';
   try {
     const quota = async () => new Response(JSON.stringify({ error: { message: 'quota', errors: [{ reason: 'quotaExceeded' }] } }), { status: 403 });

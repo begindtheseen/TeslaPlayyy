@@ -5,6 +5,7 @@ import { statSync, appendFileSync } from 'node:fs';
 import path from 'node:path';
 
 const args = process.argv.slice(2);
+if (args.includes('--version')) { process.stdout.write('2026.08.19-fake\n'); process.exit(0); }
 const url = args[args.length - 1];
 const id = new URL(url).searchParams.get('v');
 const clients = (args[args.indexOf('--extractor-args') + 1] || '').replace('youtube:player_client=', '');

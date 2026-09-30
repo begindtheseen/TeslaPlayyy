@@ -1,12 +1,15 @@
-// Canvas playback worker: fetch MPEG-TS -> TSDemuxer -> VideoDecoder -> OffscreenCanvas,
-//                                               \-> AudioDecoder -> PCM posted to the main thread (Web Audio).
+// Canvas playback worker. Two sources feed the same decode/render pipeline:
+//   url  : one MPEG-TS stream (demo, catalog, server-muxed YouTube) -> TSDemuxer
+//   dual : YouTube DASH video + audio fMP4 via the range proxy        -> Fmp4Demuxer x2 (sidx seeking)
+// -> VideoDecoder -> OffscreenCanvas, and AudioDecoder -> PCM posted to the main thread (Web Audio).
 // The main thread owns the media clock (audio-master) and posts it here; this worker only presents
-// video frames whose timestamp is due on that clock.
+// video frames whose timestamp is due on that clock. All timestamps are microseconds (WebCodecs units).
 //
-// Main -> worker: init{canvas} open{url,startTime,seekTo,hasAudio} clock{mediaTime,at,rate} stop
+// Main -> worker: init{canvas} open{url|dual:{video,audio},startTime,seekTo,hasAudio,duration} clock{mediaTime,at,rate} stop
 // Worker -> main: status tracks videoConfig audioConfig audio{time,duration,sampleRate,planes} buffered{until}
 //                 ready{time} buffering{value} frame{time} ended stats error{message,fatal}
 import { TSDemuxer } from '../lib/ts/demuxer.js';
+import { parseInit, segmentFor, Fmp4Demuxer } from '../lib/mp4/fmp4.js';
 
 const MAX_AHEAD_S = 8;        // stop reading the network once this much media is demuxed ahead of the clock
 const MAX_DECODE_QUEUE = 8;   // encoded chunks inside VideoDecoder
@@ -17,6 +20,10 @@ let ctx = null;
 let gen = 0;                  // generation counter; bumps on open/seek/stop to ignore stale async work
 let s = null;                 // per-load state
 let clock = { mediaTime: 0, at: 0, rate: 0 };
+// Every VideoDecoder/AudioDecoder ever created and not yet closed; must stay <= 2 across seeks.
+const openDecoders = new Set();
+const closeDecoder = d => { if (!d) return; openDecoders.delete(d); try { if (d.state !== 'closed') d.close(); } catch {} };
+const statsMsg = () => ({ stats: { ...s.stats, openDecoders: openDecoders.size } });
 
 const post = (type, extra = {}, transfer) => postMessage({ type, gen, ...extra }, transfer || []);
 const wallNow = () => performance.timeOrigin + performance.now();
@@ -30,16 +37,16 @@ function teardown() {
   for (const f of s.frames) f.close();
   s.frames = [];
   s.pendingVideo = [];
-  for (const d of [s.videoDecoder, s.audioDecoder]) { try { if (d && d.state !== 'closed') d.close(); } catch {} }
+  closeDecoder(s.videoDecoder); closeDecoder(s.audioDecoder);
   s = null;
 }
 
-function open({ url, startTime = 0, seekTo = 0, hasAudio = false, duration = null }) {
+function open({ url, dual = null, startTime = 0, seekTo = 0, hasAudio = false, duration = null }) {
   teardown();
   const myGen = ++gen;
   clock = { mediaTime: seekTo, at: wallNow(), rate: 0 };
   s = {
-    gen: myGen, url, base: startTime * 1e6, target: seekTo, hasAudio, duration,
+    gen: myGen, url, dual: !!dual, base: startTime * 1e6, target: seekTo, hasAudio: hasAudio && (!dual || !!dual.audio), duration, tracks: null, audioFailed: false,
     lastVideoIn: -Infinity, lastAudioIn: -Infinity, lastFrameOut: -Infinity, reconnects: 0,
     abort: new AbortController(),
     demuxer: null, videoDecoder: null, audioDecoder: null, videoConfig: null, audioConfig: null,
@@ -48,20 +55,14 @@ function open({ url, startTime = 0, seekTo = 0, hasAudio = false, duration = nul
     buffering: false, starvedSince: 0, lastFramePost: 0, lastPresented: -1,
     stats: { reconnects: 0, lateSumMs: 0, lateMaxMs: 0, decoded: 0, presented: 0, dropped: 0, prerollSkipped: 0, decoderRestarts: 0, audioChunks: 0, bytes: 0 },
   };
+  if (dual) { openDual(myGen, dual); raf(() => render(myGen)); return; }
   s.demuxer = new TSDemuxer({
     onTracks: t => { post('tracks', { video: t.video?.codec || null, audio: t.audio?.codec || null, unsupported: t.unsupported.map(u => u.codec) });
       if (!t.video) fail('Stream has no H.264 video track' + (t.unsupported.length ? ` (found ${t.unsupported.map(u => u.codec).join(', ')})` : ''), true); },
     onVideoConfig: c => configureVideo(c, myGen),
     onAudioConfig: c => configureAudio(c, myGen),
-    onVideo: v => {
-      if (myGen !== gen) return;
-      // After a reconnect the new stream restarts at a keyframe at/before the cut: keep feeding the
-      // decoder from that keyframe, but decoded frames already shown are dropped in the output callback.
-      s.pendingVideo.push(v);
-      if (v.timestamp > s.lastVideoIn) { s.lastVideoIn = v.timestamp; noteDemuxed(v.timestamp); }
-      pump();
-    },
-    onAudio: a => { if (myGen === gen && a.timestamp > s.lastAudioIn) { s.lastAudioIn = a.timestamp; decodeAudio(a); } },
+    onVideo: v => onVideoChunk(v, myGen),
+    onAudio: a => onAudioChunk(a, myGen),
     onDiscontinuity: d => post('status', { text: `Stream discontinuity on PID ${d.pid} (${d.reason})` }),
   });
   read(myGen).catch(e => { if (myGen === gen && e.name !== 'AbortError') fail(`Network error: ${e.message}`, true); });
@@ -70,9 +71,158 @@ function open({ url, startTime = 0, seekTo = 0, hasAudio = false, duration = nul
 
 function fail(message, fatal = false) { post('error', { message, fatal }); if (fatal && s) s.abort.abort(); }
 
-function noteDemuxed(tsUs) {
+function noteDemuxed(tsUs, kind) {
   const t = (tsUs - s.base) / 1e6;
-  if (t > s.demuxedUntil) { s.demuxedUntil = t; }
+  if (!s.tracks) { if (t > s.demuxedUntil) s.demuxedUntil = t; return; }
+  const tr = s.tracks[kind];
+  if (tr && t > tr.until) tr.until = t;
+  // Both tracks must be demuxed for media time to count as buffered.
+  s.demuxedUntil = Math.min(...Object.values(s.tracks).filter(x => !x.failed).map(x => x.until));
+}
+
+// ---- dual DASH source: video + audio fMP4 fetched by byte range through /api/stream --------------------
+const INIT_PROBE_BYTES = 64 * 1024;
+
+async function fetchRange(url, from, to, signal) {
+  const r = await fetch(url, { headers: { Range: `bytes=${from}-${to ?? ''}` }, signal });
+  if (!r.ok) {
+    let msg = `Stream request failed (HTTP ${r.status})`;
+    try { const j = await r.json(); if (j.error) msg = j.error; } catch {}
+    throw Object.assign(new Error(msg), { status: r.status });
+  }
+  return r;
+}
+const totalOf = r => Number(/\/(\d+)$/.exec(r.headers.get('content-range') || '')?.[1]) || null;
+
+// ftyp + moov + sidx: a 64 KB probe covers it for typical videos; grows for very long ones.
+async function loadInit(url, signal) {
+  let want = INIT_PROBE_BYTES;
+  for (let i = 0; i < 6; i++) {
+    const r = await fetchRange(url, 0, want - 1, signal);
+    const total = totalOf(r);
+    const bytes = new Uint8Array(await r.arrayBuffer());
+    const init = parseInit(bytes);
+    if (init.status === 'ok') return { ...init, total };
+    if (!Number.isFinite(init.need) || bytes.length < want || init.need > 8 * 1024 * 1024) throw new Error('Could not read the stream index');
+    want = Math.max(init.need + 4096, want * 2);
+  }
+  throw new Error('Stream index too large');
+}
+
+function openDual(myGen, dual) {
+  s.tracks = { video: { url: dual.video, until: s.target, done: false, failed: false, reconnects: 0 } };
+  if (s.hasAudio) s.tracks.audio = { url: dual.audio, until: s.target, done: false, failed: false, reconnects: 0 };
+  post('status', { text: `Receiving DASH ${s.tracks.audio ? 'video + audio' : 'video'} via range proxy` });
+  for (const kind of Object.keys(s.tracks)) {
+    readTrack(myGen, kind).catch(e => {
+      if (myGen !== gen || e.name === 'AbortError') return;
+      if (kind === 'video') return fail(`Network error: ${e.message}`, true);
+      // Audio trouble degrades to video-only playback instead of stopping the picture.
+      post('status', { text: `Audio unavailable (${e.message}); playing video only` });
+      s.audioFailed = true; s.tracks.audio.failed = true; trackDone(myGen, 'audio');
+    });
+  }
+}
+
+function trackDone(myGen, kind) {
+  if (myGen !== gen) return;
+  s.tracks[kind].done = true;
+  if (Object.values(s.tracks).every(x => x.done)) {
+    s.streamDone = true;
+    post('buffered', { until: s.duration ?? s.demuxedUntil, complete: true });
+    pump();
+  }
+}
+
+async function readTrack(myGen, kind) {
+  const tr = s.tracks[kind];
+  const init = await loadInit(tr.url, s.abort.signal);
+  if (myGen !== gen) return;
+  tr.init = init;
+  const t = init.track;
+  if (t.kind !== kind) throw new Error(`Expected a ${kind} track, got ${t.kind}`);
+  if (kind === 'video') await configureVideo({ codec: t.codec, width: t.width, height: t.height, description: t.description }, myGen);
+  else await configureAudio({ codec: t.codec, sampleRate: t.sampleRate, numberOfChannels: t.numberOfChannels, description: t.description }, myGen);
+  if (myGen !== gen) return;
+  if (kind === 'audio' && !s.audioConfig) throw new Error('audio codec unsupported');
+  if (!init.segments) post('status', { text: `${kind} stream has no sidx index: reading from the start` });
+  let from = s.target;
+  for (;;) {
+    // Seek = map media time -> sidx segment -> byte offset; the segment starts on a keyframe.
+    const seg = segmentFor(init.segments, from, t.offsetUs);
+    let result;
+    try { result = await readFrom(myGen, kind, seg ? seg.offset : init.firstFragment); }
+    catch (e) {
+      if (myGen !== gen || e.name === 'AbortError') return;
+      if (e.status && e.status < 500) throw e; // expired session, gone, forbidden: not retryable here
+      result = { error: e };
+    }
+    if (myGen !== gen) return;
+    if (!result.error && result.complete) break;
+    s.stats.reconnects++;
+    if (++tr.reconnects > MAX_RECONNECTS) throw new Error(`stream interrupted repeatedly${result.error ? `: ${result.error.message}` : ''}`);
+    post('status', { text: `${kind} stream interrupted at ${tr.until.toFixed(1)} s; reconnecting (${tr.reconnects}/${MAX_RECONNECTS})` });
+    await sleep(Math.min(4000, 250 * 2 ** (tr.reconnects - 1)));
+    if (myGen !== gen) return;
+    from = Math.max(s.target, tr.until); // duplicates are filtered by timestamp downstream
+  }
+  trackDone(myGen, kind);
+}
+
+// Byte window for one request: whole sidx segments from `start`, up to WINDOW_BYTES (at least one).
+// Bounded requests keep a seek or stop from wasting more than one window of CDN transfer.
+const WINDOW_BYTES = 2 * 1024 * 1024;
+function nextWindow(segments, start) {
+  const i = segments ? segments.findIndex(g => g.offset === start) : -1;
+  if (i < 0) return { end: null, next: null }; // no index: one open-ended request
+  let j = i + 1, end = segments[i].offset + segments[i].size - 1;
+  while (j < segments.length && segments[j].offset + segments[j].size - start <= WINDOW_BYTES) { end = segments[j].offset + segments[j].size - 1; j++; }
+  return { end, next: j < segments.length ? segments[j].offset : null };
+}
+
+const ahead = (tr, kind) => tr.until - Math.max(mediaNow(), s.target) > MAX_AHEAD_S || (kind === 'video' && s.pendingVideo.length > 400);
+
+// Reads consecutive windows from `start` to the end of the track through one demuxer.
+async function readFrom(myGen, kind, start) {
+  const tr = s.tracks[kind];
+  const dem = new Fmp4Demuxer(tr.init.track, { startOffset: start, onSample: x => (kind === 'video' ? onVideoChunk(x, myGen) : onAudioChunk(x, myGen, 'audio')) });
+  let lastBufferedPost = 0;
+  for (let pos = start; pos !== null;) {
+    // Per-track backpressure: no new request while this track is MAX_AHEAD_S ahead of the clock.
+    while (myGen === gen && ahead(tr, kind)) await sleep(50);
+    if (myGen !== gen) return {};
+    const w = nextWindow(tr.init.segments, pos);
+    const r = await fetchRange(tr.url, pos, w.end, s.abort.signal);
+    const want = w.end === null ? (tr.init.total ?? totalOf(r)) - pos : w.end - pos + 1;
+    const reader = r.body.getReader();
+    let got = 0;
+    for (;;) {
+      while (myGen === gen && ahead(tr, kind)) await sleep(50);
+      if (myGen !== gen) { reader.cancel().catch(() => {}); return {}; }
+      const { done, value } = await reader.read();
+      if (myGen !== gen) return {};
+      if (done) break;
+      got += value.length;
+      s.stats.bytes += value.length;
+      dem.push(value);
+      if (performance.now() - lastBufferedPost > 250) { lastBufferedPost = performance.now(); post('buffered', { until: s.demuxedUntil }); }
+    }
+    if (Number.isFinite(want) && got < want) return { error: new Error(`connection closed after ${got} of ${want} bytes`) };
+    pos = w.next;
+  }
+  return { complete: true };
+}
+
+// Shared by both sources. After a reconnect the stream restarts at a keyframe at/before the cut: keep
+// feeding the decoder from that keyframe; frames already shown are dropped in the output callback.
+function onVideoChunk(v, myGen) {
+  if (myGen !== gen) return;
+  s.pendingVideo.push(v);
+  if (v.timestamp > s.lastVideoIn) { s.lastVideoIn = v.timestamp; noteDemuxed(v.timestamp, 'video'); }
+  pump();
+}
+function onAudioChunk(a, myGen, kind) {
+  if (myGen === gen && a.timestamp > s.lastAudioIn) { s.lastAudioIn = a.timestamp; decodeAudio(a, kind); }
 }
 
 const MAX_RECONNECTS = 6;
@@ -136,7 +286,8 @@ async function configureVideo(c, myGen) {
   const v = s.videoConfig;
   if (v && v.codec === c.codec && v.codedWidth === c.width && v.codedHeight === c.height && s.videoDecoder?.state === 'configured') return; // same stream after reconnect
   if (typeof VideoDecoder === 'undefined') return fail('WebCodecs VideoDecoder is not available in this browser', true);
-  const config = { codec: c.codec, codedWidth: c.width, codedHeight: c.height, optimizeForLatency: true };
+  // With `description` (avcC, from fMP4) chunks are AVCC length-prefixed; without it, Annex B (from TS).
+  const config = { codec: c.codec, codedWidth: c.width, codedHeight: c.height, optimizeForLatency: true, ...(c.description ? { description: c.description } : {}) };
   const support = await VideoDecoder.isConfigSupported(config).catch(e => ({ supported: false, error: e }));
   if (myGen !== gen) return;
   if (!support.supported) return fail(`This browser cannot decode ${c.codec} (${c.width}x${c.height}) with WebCodecs`, true);
@@ -148,8 +299,8 @@ async function configureVideo(c, myGen) {
 
 function createVideoDecoder() {
   const myGen = gen;
-  try { if (s.videoDecoder && s.videoDecoder.state !== 'closed') s.videoDecoder.close(); } catch {}
-  s.videoDecoder = new VideoDecoder({
+  closeDecoder(s.videoDecoder);
+  const d = new VideoDecoder({
     output: frame => {
       if (myGen !== gen || !s) { frame.close(); return; }
       s.stats.decoded++;
@@ -161,6 +312,7 @@ function createVideoDecoder() {
       if (s.frames.length > MAX_FRAMES * 2) { s.frames.shift().close(); s.stats.dropped++; }
     },
     error: e => {
+      openDecoders.delete(d); // an errored decoder is closed by the browser
       if (myGen !== gen || !s) return;
       s.stats.decoderRestarts++;
       if (s.stats.decoderRestarts > MAX_DECODER_RESTARTS) return fail(`Video decoder failed repeatedly: ${e.message}`, true);
@@ -168,6 +320,8 @@ function createVideoDecoder() {
       createVideoDecoder();
     },
   });
+  openDecoders.add(d);
+  s.videoDecoder = d;
   s.videoDecoder.addEventListener?.('dequeue', pump);
   s.videoDecoder.configure(s.videoConfig);
   s.needKey = true;
@@ -194,11 +348,11 @@ async function configureAudio(c, myGen) {
   if (myGen !== gen) return;
   const a = s.audioConfig;
   if (a && a.codec === c.codec && a.sampleRate === c.sampleRate && a.numberOfChannels === c.numberOfChannels && s.audioDecoder?.state === 'configured') return;
-  if (typeof AudioDecoder === 'undefined') { post('status', { text: 'AudioDecoder unavailable: playing video only' }); return; }
+  if (typeof AudioDecoder === 'undefined') { s.audioFailed = true; post('status', { text: 'AudioDecoder unavailable: playing video only' }); return; }
   const config = { codec: c.codec, sampleRate: c.sampleRate, numberOfChannels: c.numberOfChannels, description: c.description };
   const support = await AudioDecoder.isConfigSupported(config).catch(() => ({ supported: false }));
   if (myGen !== gen) return;
-  if (!support.supported) { post('status', { text: `Audio codec ${c.codec} unsupported: playing video only` }); return; }
+  if (!support.supported) { s.audioFailed = true; post('status', { text: `Audio codec ${c.codec} unsupported: playing video only` }); return; }
   s.audioConfig = config;
   post('audioConfig', { codec: c.codec, sampleRate: c.sampleRate, channels: c.numberOfChannels });
   createAudioDecoder();
@@ -206,8 +360,8 @@ async function configureAudio(c, myGen) {
 
 function createAudioDecoder() {
   const myGen = gen;
-  try { if (s.audioDecoder && s.audioDecoder.state !== 'closed') s.audioDecoder.close(); } catch {}
-  s.audioDecoder = new AudioDecoder({
+  closeDecoder(s.audioDecoder);
+  const d = new AudioDecoder({
     output: data => {
       if (myGen !== gen || !s) { data.close(); return; }
       const time = (data.timestamp - s.base) / 1e6;
@@ -225,16 +379,19 @@ function createAudioDecoder() {
       post('audio', { time, duration, sampleRate, planes }, planes.map(p => p.buffer));
     },
     error: e => {
+      openDecoders.delete(d);
       if (myGen !== gen || !s) return;
       post('status', { text: `Audio decoder error (${e.message}); restarting` });
       if (++s.stats.decoderRestarts <= MAX_DECODER_RESTARTS) createAudioDecoder();
     },
   });
+  openDecoders.add(d);
+  s.audioDecoder = d;
   s.audioDecoder.configure(s.audioConfig);
 }
 
-function decodeAudio(a) {
-  noteDemuxed(a.timestamp);
+function decodeAudio(a, kind) {
+  noteDemuxed(a.timestamp, kind);
   const d = s.audioDecoder;
   if (!d || d.state !== 'configured') return;
   try { d.decode(new EncodedAudioChunk({ type: 'key', timestamp: a.timestamp, duration: a.duration, data: a.data })); }
@@ -257,7 +414,9 @@ function render(myGen) {
   const frames = s.frames;
   if (!s.readySent) {
     // Show the first frame at/after the target as a poster; the main thread starts the clock on 'ready'.
-    const audioReady = !s.hasAudio || !s.audioConfig || s.stats.audioChunks > 5 || s.streamDone;
+    // Dual source: the audio track configures asynchronously, so wait for it unless it failed.
+    const audioPending = s.hasAudio && !s.audioFailed && (s.dual || !!s.audioConfig);
+    const audioReady = !audioPending || s.stats.audioChunks > 5 || s.streamDone;
     if (frames.length && audioReady) {
       draw(frames[0]);
       s.readySent = true;
@@ -278,10 +437,10 @@ function render(myGen) {
       s.stats.lateSumMs += lateMs; s.stats.lateMaxMs = Math.max(s.stats.lateMaxMs, lateMs);
       f.close();
       s.stats.presented++;
-      if (performance.now() - s.lastFramePost > 250) { s.lastFramePost = performance.now(); post('frame', { time: s.lastPresented }); post('stats', { stats: s.stats }); }
+      if (performance.now() - s.lastFramePost > 250) { s.lastFramePost = performance.now(); post('frame', { time: s.lastPresented }); post('stats', statsMsg()); }
     }
     const drained = s.streamDone && !s.pendingVideo.length && s.decoderDrained && !frames.length;
-    if (drained && !s.ended) { s.ended = true; post('frame', { time: s.lastPresented }); post('stats', { stats: s.stats }); post('ended', { time: s.lastPresented }); }
+    if (drained && !s.ended) { s.ended = true; post('frame', { time: s.lastPresented }); post('stats', statsMsg()); post('ended', { time: s.lastPresented }); }
     // Starvation: nothing decoded to show and the network has not finished.
     const starving = !frames.length && !drained && !s.streamDone;
     if (starving && !s.starvedSince) s.starvedSince = performance.now();
