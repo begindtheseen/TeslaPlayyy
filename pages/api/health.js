@@ -22,7 +22,7 @@ export default async function handler(req, res) {
     sessions: sessionCount(),
     activeStreams: activeProcesses().size,   // FFmpeg processes (catalog streams + /api/muxed)
     activeRelays: relay.active,              // open googlevideo range relays (/api/stream + FFmpeg inputs)
-    relay: { total: relay.total, bytes: relay.bytes, urlRefreshes: relay.refreshes, upstreamErrors: relay.upstreamErrors },
+    relay: { total: relay.total, bytes: relay.bytes, urlRefreshes: relay.refreshes, resumes: relay.resumes, upstreamErrors: relay.upstreamErrors },
     extraction: { ...extraction, clients: clientGroups() },
     egress: egressSummary(),
   });

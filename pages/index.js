@@ -98,7 +98,7 @@ export default function Home() {
           <span>YouTube search · MPEG-TS → WebCodecs → OffscreenCanvas player</span>
         </header>
 
-        <Player ref={player} onStatus={onStatus} />
+        <Player ref={player} onStatus={onStatus} onStop={() => { setPlaying(null); setSelected(null); setStatus('Stopped'); }} />
         <div className="status" role="status" aria-live="polite" data-testid="status">{status}</div>
 
         <div className="prefs" role="group" aria-label="YouTube playback settings">

@@ -24,7 +24,7 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--canvas);outline
 .warn{color:#f5c04a}
 
 .controls{display:flex;align-items:center;gap:8px;padding:10px 0;flex-wrap:wrap}
-.controls button{background:#fff;color:#000;min-width:44px;min-height:44px;padding:8px 12px}
+.controls button{background:#fff;color:#000;min-width:52px;min-height:52px;padding:8px 14px;font-size:18px}
 .controls .time{font-variant-numeric:tabular-nums;font-size:13px;color:#ccc;min-width:92px}
 .seek{position:relative;flex:1 1 220px;height:44px;display:flex;align-items:center}
 .seek-buffer{position:absolute;height:6px;top:19px;background:#ffffff40;border-radius:3px;pointer-events:none}
@@ -55,3 +55,24 @@ form button{background:#fff}form button:disabled{opacity:.6}
 .skeleton{background:linear-gradient(90deg,#15171b 0%,#1d2026 50%,#15171b 100%);background-size:200% 100%;animation:shimmer 1.2s infinite}
 @keyframes shimmer{to{background-position:-200% 0}}
 @media(max-width:600px){.results{grid-template-columns:1fr}.result img,.result .thumb{width:120px;height:68px}.vol{display:none}}
+
+/* Playback settings */
+.prefs{display:flex;flex-wrap:wrap;align-items:center;gap:10px 16px;margin:0 0 14px}
+.prefs label{display:flex;align-items:center;gap:8px;font-size:14px;color:var(--muted)}
+.prefs select{min-height:48px;padding:0 12px;border-radius:10px;border:1px solid #303238;background:#15171b;color:#fff;font:inherit;font-size:15px}
+.prefs .probe{color:#6b6e76;font-size:12px}
+.overlay.error .retry{margin-top:8px;background:#fff;color:#000;min-height:52px;min-width:140px}
+.big-play{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:88px;height:88px;border-radius:50%;background:#000a;color:#fff;font-size:34px;border:2px solid #fff6;padding:0}
+.big-play:hover{background:#000c}
+
+/* Tesla touchscreen (landscape ~1920x1200 CSS px, driver arm's length): larger targets and seek thumb */
+@media (pointer:coarse),(min-width:1500px){
+  .controls{gap:10px}
+  .controls button{min-width:64px;min-height:64px;font-size:22px}
+  .seek{height:64px}.seek input{height:64px}
+  .seek-buffer{top:29px}
+  input[type=range]::-webkit-slider-thumb{width:28px;height:28px}
+  .vol{width:140px}
+  .result{min-height:110px}
+  .prefs select{min-height:56px}
+}

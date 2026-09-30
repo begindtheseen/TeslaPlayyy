@@ -100,3 +100,18 @@ test('session binding, bad input, and default combo redirect', async () => {
   assert.equal(redir.status, 307);
   assert.equal(redir.headers.get('location'), `/api/muxed/${VID}?session=${session.id}`);
 });
+
+test('CDN drops mid-transfer are resumed from the exact byte; the client gets an intact response', async () => {
+  const before = relayStats().resumes;
+  cdn.dropNext = 2; cdn.dropAfterBytes = 50_000;
+  const r = await fetch(url(134), { headers: { Range: 'bytes=1000-599999' } });
+  assert.equal(r.status, 206);
+  assert.ok(Buffer.from(await r.arrayBuffer()).equals(video.subarray(1000, 600000)));
+  assert.equal(relayStats().resumes - before, 2);
+  // More consecutive drops than the relay tolerates: the response is truncated (the client resumes by range).
+  cdn.dropNext = 10; cdn.dropAfterBytes = 1000;
+  const bad = await fetch(url(134), { headers: { Range: 'bytes=0-199999' } });
+  await assert.rejects(bad.arrayBuffer());
+  cdn.dropNext = 0;
+  assert.ok(await waitFor(() => relayStats().active === 0));
+});

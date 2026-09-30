@@ -171,6 +171,51 @@ for (const [label, query, delivery] of [['Intel path (?intel=1)', '?intel=1', 'm
   });
 }
 
+for (const [label, query] of [['muxed', '?intel=1'], ['dual', '?intel=0']]) {
+  test(`network drops (${label}): CDN cuts connections repeatedly; playback recovers, every frame shown once`, async () => {
+    const page = await newPage(query);
+    try {
+    await playPasted(page);
+    // 12 consecutive truncated responses: more than the relay's 3 in-place resumes, so recovery must
+    // also come from FFmpeg's input reconnect (muxed) or the worker's range/index retries (dual).
+    cdn.dropNext = 12; cdn.dropAfterBytes = 30_000;
+    await page.evaluate(() => window.__canvasTube.engines.canvas.seek(20));
+    await waitFor(async () => { const s = await engineState(page); return s.running && s.t >= 20; }, { timeout: 30000, msg: 'seek to 20 through drops' });
+    await waitFor(() => page.getAttribute('[data-testid=player]', 'data-ended').then(v => v === 'true'), { timeout: 40000, msg: 'ended after drops' });
+    const st = (await engineState(page)).stats;
+    const shown = st.presented + st.dropped;
+    assert.ok(shown >= 470 && shown <= 480, `frames 20-36 s shown/dropped once: ${st.presented}+${st.dropped}`);
+    assert.ok(st.dropped <= 10, `dropped ${st.dropped}`);
+    assert.equal(cdn.dropNext, 0, 'all drops were exercised');
+    assert.deepEqual(page.errors, []);
+    const h = await (await fetch(`${BASE}/api/health`)).json();
+    record(`Network drops (${label}): 12 truncated CDN responses, plays 20-36 s to the end`, 'pass',
+      `presented=${st.presented} dropped=${st.dropped} workerReconnects=${st.reconnects} relayResumes=${h.relay.resumes ?? 'n/a'}`);
+    } finally { cdn.dropNext = 0; await page.close(); }
+  });
+}
+
+for (const [label, query] of [['muxed', '?intel=1'], ['dual', '?intel=0']]) {
+  test(`slow network (${label}): CDN slower than the bitrate -> rebuffers, and playback resumes after each`, async () => {
+    const page = await newPage(query);
+    try {
+      // ~45 KB/s < the clip's ~75 KB/s (video + audio): the buffer must run dry repeatedly.
+      cdn.rateBytesPerSec = 45_000;
+      await playPasted(page);
+      const t0 = (await engineState(page)).t;
+      await sleep(20000);
+      const st = await engineState(page);
+      const played = st.t - t0;
+      // At 45/75 of real time ~12 s of media fits in 20 s. Before the rebuffer fix the first stall froze it.
+      assert.ok(st.stats.rebuffers >= 1, `expected rebuffers, got ${st.stats.rebuffers}`);
+      assert.ok(played > 6, `media advanced only ${played.toFixed(1)} s in 20 s`);
+      assert.deepEqual(page.errors, []);
+      record(`Slow network (${label}): CDN at 45 KB/s (< bitrate), recovers from every rebuffer`, 'pass',
+        `mediaAdvanced=${played.toFixed(1)}s in 20s rebuffers=${st.stats.rebuffers} dropped=${st.stats.dropped}`);
+    } finally { cdn.rateBytesPerSec = 0; await page.close(); }
+  });
+}
+
 test('auto delivery: desktop Chrome probe picks dual; Tesla UA without GPU info picks muxed', async () => {
   const page = await newPage();
   await page.locator('[data-testid=platform]').waitFor();

@@ -10,9 +10,9 @@ import { ensureDashFixture } from './dashFixture.js';
 export const FAKE_YTDLP = fileURLToPath(new URL('../fixtures/fake-yt-dlp.mjs', import.meta.url));
 
 // maxRangeBytes mimics googlevideo refusing oversized range requests (it returns 403).
-export async function startFakeCdn({ maxRangeBytes = Infinity } = {}) {
-  const { dir, files } = ensureDashFixture();
-  const cdn = { requests: [], open: 0, maxRangeBytes, dir, files, fail403: 0 };
+export async function startFakeCdn({ maxRangeBytes = Infinity, fixture } = {}) {
+  const { dir, files, meta } = ensureDashFixture(undefined, fixture);
+  const cdn = { requests: [], open: 0, maxRangeBytes, dir, files, meta, fail403: 0, dropNext: 0, dropAfterBytes: 64 * 1024, rateBytesPerSec: 0 };
   cdn.server = http.createServer((req, res) => {
     const u = new URL(req.url, 'http://x');
     const file = path.join(dir, path.basename(u.searchParams.get('f') || ''));
@@ -35,7 +35,14 @@ export async function startFakeCdn({ maxRangeBytes = Infinity } = {}) {
     if (start >= size || start > end) { res.writeHead(416, { 'Content-Range': `bytes */${size}` }); return res.end(); }
     if (end - start + 1 > cdn.maxRangeBytes) { res.statusCode = 403; return res.end('range too large'); }
     res.writeHead(206, { 'Content-Type': 'video/mp4', 'Content-Length': end - start + 1, 'Content-Range': `bytes ${start}-${end}/${size}`, 'Accept-Ranges': 'bytes' });
-    createReadStream(file, { start, end }).pipe(res);
+    // Simulated network drop: cut the connection after dropAfterBytes (for the next dropNext responses).
+    if (cdn.dropNext > 0 && end - start + 1 > cdn.dropAfterBytes) {
+      cdn.dropNext--;
+      return createReadStream(file, { start, end: start + cdn.dropAfterBytes - 1 }).on('end', () => res.destroy()).pipe(res, { end: false });
+    }
+    const body = createReadStream(file, { start, end, highWaterMark: 16 * 1024 });
+    if (cdn.rateBytesPerSec > 0) return throttle(body, res, () => cdn.rateBytesPerSec); // slow network
+    body.pipe(res);
   });
   await new Promise(r => cdn.server.listen(0, '127.0.0.1', r));
   cdn.base = `http://127.0.0.1:${cdn.server.address().port}`;
@@ -43,10 +50,22 @@ export async function startFakeCdn({ maxRangeBytes = Infinity } = {}) {
   return cdn;
 }
 
+// Paces a stream to `rate()` bytes/s (re-read per chunk so tests can change it mid-response).
+function throttle(src, res, rate) {
+  src.on('data', chunk => {
+    src.pause();
+    const ok = res.write(chunk);
+    const wait = rate() > 0 ? (chunk.length / rate()) * 1000 : 0;
+    setTimeout(() => (ok ? src.resume() : res.once('drain', () => src.resume())), wait);
+  });
+  src.on('end', () => res.end());
+  res.on('close', () => src.destroy());
+}
+
 // Env that points the server code at the fakes.
 export function fakeYoutubeEnv(cdn, extra = {}) {
   return {
     YTDLP_PATH: FAKE_YTDLP, FAKE_CDN_BASE: cdn.base, FAKE_FIXTURE_DIR: cdn.dir,
-    CDN_ALLOWED_HOSTS: '127.0.0.1', MEDIA_ALLOW_PRIVATE_NETWORK: '1', ...extra,
+    FAKE_VIDEO: JSON.stringify(cdn.meta), CDN_ALLOWED_HOSTS: '127.0.0.1', MEDIA_ALLOW_PRIVATE_NETWORK: '1', ...extra,
   };
 }

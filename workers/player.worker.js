@@ -23,7 +23,9 @@ let clock = { mediaTime: 0, at: 0, rate: 0 };
 // Every VideoDecoder/AudioDecoder ever created and not yet closed; must stay <= 2 across seeks.
 const openDecoders = new Set();
 const closeDecoder = d => { if (!d) return; openDecoders.delete(d); try { if (d.state !== 'closed') d.close(); } catch {} };
-const statsMsg = () => ({ stats: { ...s.stats, openDecoders: openDecoders.size } });
+const statsMsg = () => ({ stats: { ...s.stats, openDecoders: openDecoders.size,
+  pendingVideo: s.pendingVideo.length, heldFrames: s.frames.length, decodeQueue: s.videoDecoder?.decodeQueueSize ?? null,
+  decoderState: s.videoDecoder?.state ?? null, demuxedUntil: +s.demuxedUntil.toFixed(2), needKey: s.needKey } });
 
 const post = (type, extra = {}, transfer) => postMessage({ type, gen, ...extra }, transfer || []);
 const wallNow = () => performance.timeOrigin + performance.now();
@@ -34,6 +36,7 @@ const raf = typeof requestAnimationFrame === 'function' ? cb => requestAnimation
 function teardown() {
   if (!s) return;
   s.abort.abort();
+  clearInterval(s.watchdog);
   for (const f of s.frames) f.close();
   s.frames = [];
   s.pendingVideo = [];
@@ -53,9 +56,11 @@ function open({ url, dual = null, startTime = 0, seekTo = 0, hasAudio = false, d
     pendingVideo: [], frames: [], needKey: true,
     demuxedUntil: seekTo, streamDone: false, flushed: false, readySent: false, ended: false,
     buffering: false, starvedSince: 0, lastFramePost: 0, lastPresented: -1,
-    stats: { reconnects: 0, lateSumMs: 0, lateMaxMs: 0, decoded: 0, presented: 0, dropped: 0, prerollSkipped: 0, decoderRestarts: 0, audioChunks: 0, bytes: 0 },
+    stats: { reconnects: 0, lateSumMs: 0, lateMaxMs: 0, decoded: 0, presented: 0, dropped: 0, prerollSkipped: 0, decoderRestarts: 0, audioChunks: 0, bytes: 0, loopRescues: 0, rebuffers: 0 },
+    rafPending: false, rafAt: 0, watchdog: 0,
   };
-  if (dual) { openDual(myGen, dual); raf(() => render(myGen)); return; }
+  startLoop(myGen);
+  if (dual) { openDual(myGen, dual); return; }
   s.demuxer = new TSDemuxer({
     onTracks: t => { post('tracks', { video: t.video?.codec || null, audio: t.audio?.codec || null, unsupported: t.unsupported.map(u => u.codec) });
       if (!t.video) fail('Stream has no H.264 video track' + (t.unsupported.length ? ` (found ${t.unsupported.map(u => u.codec).join(', ')})` : ''), true); },
@@ -66,7 +71,6 @@ function open({ url, dual = null, startTime = 0, seekTo = 0, hasAudio = false, d
     onDiscontinuity: d => post('status', { text: `Stream discontinuity on PID ${d.pid} (${d.reason})` }),
   });
   read(myGen).catch(e => { if (myGen === gen && e.name !== 'AbortError') fail(`Network error: ${e.message}`, true); });
-  raf(() => render(myGen));
 }
 
 function fail(message, fatal = false) { post('error', { message, fatal }); if (fatal && s) s.abort.abort(); }
@@ -136,7 +140,18 @@ function trackDone(myGen, kind) {
 
 async function readTrack(myGen, kind) {
   const tr = s.tracks[kind];
-  const init = await loadInit(tr.url, s.abort.signal);
+  let init;
+  for (let attempt = 1; ; attempt++) {
+    try { init = await loadInit(tr.url, s.abort.signal); break; }
+    catch (e) {
+      if (myGen !== gen || e.name === 'AbortError') return;
+      if ((e.status && e.status < 500) || attempt >= 4) throw e;
+      s.stats.reconnects++;
+      post('status', { text: `${kind} stream index failed (${e.message}); retrying (${attempt}/3)` });
+      await sleep(300 * 2 ** (attempt - 1));
+      if (myGen !== gen) return;
+    }
+  }
   if (myGen !== gen) return;
   tr.init = init;
   const t = init.track;
@@ -408,6 +423,25 @@ function draw(frame) {
   ctx.drawImage(frame, 0, 0, ctx.canvas.width, ctx.canvas.height);
 }
 
+// The render loop runs on the worker's requestAnimationFrame, which Chrome services through the
+// OffscreenCanvas frame cycle and may stop delivering while nothing is drawn. The decoder is fed from
+// that loop, so a 50 ms watchdog keeps feeding it and restarts the loop if a callback is overdue.
+function schedule(myGen) {
+  if (!s || s.rafPending) return;
+  s.rafPending = true; s.rafAt = performance.now();
+  raf(() => { if (myGen !== gen || !s) return; s.rafPending = false; render(myGen); });
+}
+function startLoop(myGen) {
+  schedule(myGen);
+  let ticks = 0;
+  s.watchdog = setInterval(() => {
+    if (myGen !== gen || !s) return;
+    if (++ticks % 10 === 0) post('stats', statsMsg()); // also a liveness signal for the main thread
+    pump();
+    if (s.rafPending && performance.now() - s.rafAt > 100) { s.stats.loopRescues++; s.rafPending = false; render(myGen); }
+  }, 50);
+}
+
 function render(myGen) {
   if (myGen !== gen || !s) return;
   pump();
@@ -424,32 +458,46 @@ function render(myGen) {
     } else if (s.streamDone && s.decoderDrained && !frames.length) {
       s.readySent = true; s.ended = true; post('ended', { reason: 'no-frames' });
     }
-  } else if (clock.rate) {
-    const now = mediaNow();
-    // Drop frames that are already late (a newer frame is also due).
-    while (frames.length > 1 && frameTime(frames[1]) <= now) { frames.shift().close(); s.stats.dropped++; }
-    if (frames.length && frameTime(frames[0]) <= now + 0.004) {
-      const f = frames.shift();
-      draw(f);
-      s.lastPresented = frameTime(f);
-      // Presentation error vs the (audio-master) clock: how late this frame hit the canvas.
-      const lateMs = (now - s.lastPresented) * 1000;
-      s.stats.lateSumMs += lateMs; s.stats.lateMaxMs = Math.max(s.stats.lateMaxMs, lateMs);
-      f.close();
-      s.stats.presented++;
-      if (performance.now() - s.lastFramePost > 250) { s.lastFramePost = performance.now(); post('frame', { time: s.lastPresented }); post('stats', statsMsg()); }
+  } else {
+    if (clock.rate) present();
+    // Leave buffering once ~250 ms of frames are decoded (or the stream is done). This must not depend
+    // on clock.rate: entering buffering makes the main thread stop the clock (rate 0), so a check that
+    // only runs while the clock moves could never end a rebuffer.
+    const ahead = frames.length ? frameTime(frames[frames.length - 1]) - frameTime(frames[0]) : 0;
+    if (s.buffering && (ahead >= 0.25 || frames.length >= MAX_FRAMES - 1 || s.streamDone)) {
+      s.buffering = false; s.starvedSince = 0;
+      post('buffering', { value: false }); post('stats', statsMsg());
     }
-    const drained = s.streamDone && !s.pendingVideo.length && s.decoderDrained && !frames.length;
-    if (drained && !s.ended) { s.ended = true; post('frame', { time: s.lastPresented }); post('stats', statsMsg()); post('ended', { time: s.lastPresented }); }
-    // Starvation: nothing decoded to show and the network has not finished.
-    const starving = !frames.length && !drained && !s.streamDone;
-    if (starving && !s.starvedSince) s.starvedSince = performance.now();
-    if (!starving) s.starvedSince = 0;
-    const buffering = starving && performance.now() - s.starvedSince > 120;
-    if (buffering !== s.buffering) { s.buffering = buffering; post('buffering', { value: buffering }); }
-    else if (s.buffering && frames.length >= 3) { s.buffering = false; post('buffering', { value: false }); }
   }
-  raf(() => render(myGen));
+  schedule(myGen);
+}
+
+function present() {
+  const frames = s.frames;
+  const now = mediaNow();
+  // Drop frames that are already late (a newer frame is also due).
+  while (frames.length > 1 && frameTime(frames[1]) <= now) { frames.shift().close(); s.stats.dropped++; }
+  if (frames.length && frameTime(frames[0]) <= now + 0.004) {
+    const f = frames.shift();
+    draw(f);
+    s.lastPresented = frameTime(f);
+    // Presentation error vs the (audio-master) clock: how late this frame hit the canvas.
+    const lateMs = (now - s.lastPresented) * 1000;
+    s.stats.lateSumMs += lateMs; s.stats.lateMaxMs = Math.max(s.stats.lateMaxMs, lateMs);
+    f.close();
+    s.stats.presented++;
+    if (performance.now() - s.lastFramePost > 250) { s.lastFramePost = performance.now(); post('frame', { time: s.lastPresented }); post('stats', statsMsg()); }
+  }
+  const drained = s.streamDone && !s.pendingVideo.length && s.decoderDrained && !frames.length;
+  if (drained && !s.ended) { s.ended = true; post('frame', { time: s.lastPresented }); post('stats', statsMsg()); post('ended', { time: s.lastPresented }); }
+  // Starvation: nothing decoded to show and the network has not finished.
+  const starving = !frames.length && !drained && !s.streamDone;
+  if (starving && !s.starvedSince) s.starvedSince = performance.now();
+  if (!starving) s.starvedSince = 0;
+  if (!s.buffering && starving && performance.now() - s.starvedSince > 120) {
+    s.buffering = true; s.stats.rebuffers++;
+    post('buffering', { value: true }); post('stats', statsMsg());
+  }
 }
 
 self.onmessage = e => {

@@ -19,7 +19,7 @@ const ERROR_TITLES = {
 const INITIAL = { playing: false, buffering: false, loading: false, ended: false, current: 0, duration: null, bufferedFrom: 0, bufferedUntil: 0, error: null, audioLocked: false, clockMode: null };
 
 // Independent canvas player: MPEG-TS -> worker demux -> WebCodecs -> OffscreenCanvas + Web Audio.
-const Player = forwardRef(function Player({ onStatus }, ref) {
+const Player = forwardRef(function Player({ onStatus, onStop }, ref) {
   const shell = useRef(null), canvas = useRef(null);
   const engines = useRef({ canvas: null });
   const active = useRef(null);
@@ -130,7 +130,10 @@ const Player = forwardRef(function Player({ onStatus }, ref) {
             {!support.ok && <p className="warn">Canvas player unavailable in this browser: missing {support.missing?.join(', ')}.</p>}
           </div>
         )}
-        {kind === 'canvas' && (st.loading || st.buffering) && !st.error && <div className="overlay pointer-none" role="status" aria-live="polite"><div className="spinner" aria-hidden /><span className="sr-only">Buffering</span></div>}
+        {kind === 'canvas' && (st.loading || st.buffering) && !st.error && <div className="overlay pointer-none" role="status" aria-live="polite" data-testid="spinner"><div className="spinner" aria-hidden /><span className="sr-only">Buffering</span></div>}
+        {kind === 'canvas' && !st.playing && !st.loading && !st.buffering && !st.error && (
+          <button className="big-play" onClick={toggle} aria-label={st.ended ? 'Replay' : 'Play'} data-testid="big-play">{st.ended ? '↻' : '▶'}</button>
+        )}
         {st.error && (
           <div className="overlay error" role="alert" data-testid="player-error">
             <strong data-testid="error-title">{ERROR_TITLES[st.errorCode] || 'Can’t play this'}</strong><p>{st.error}</p>
@@ -143,6 +146,7 @@ const Player = forwardRef(function Player({ onStatus }, ref) {
       {kind === 'canvas' && (
         <div className="controls" role="group" aria-label="Playback controls">
           <button onClick={toggle} aria-label={st.playing && !st.ended ? 'Pause' : 'Play'} data-testid="btn-play">{st.playing && !st.ended ? '❚❚' : st.ended ? '↻' : '▶'}</button>
+          <button onClick={() => { engine()?.stop(); active.current = null; setKind(null); setSt(INITIAL); onStop?.(); }} aria-label="Stop" data-testid="btn-stop">■</button>
           <button onClick={() => seekBy(-10)} aria-label="Back 10 seconds">↶10</button>
           <button onClick={() => seekBy(10)} aria-label="Forward 10 seconds">10↷</button>
           <span className="time" data-testid="time">{fmt(shown)} / {dur ? fmt(dur) : '--:--'}</span>

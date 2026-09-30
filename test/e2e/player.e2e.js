@@ -156,7 +156,7 @@ test('canvas player: A/V fixture plays audio after a user gesture, stays in sync
   // 751 KB fixture fits in loopback socket buffers it completes first (also true before the YouTube work).
   // The invariant that matters either way: every frame shown exactly once.
   if (fin.reconnects === 0) console.log('note: stream completed before the forced cut; no reconnect exercised');
-  assert.ok(fin.presented + fin.dropped >= 235 && fin.presented + fin.dropped <= 240, `frames shown+dropped ${fin.presented}+${fin.dropped}`);
+  assert.ok(fin.presented + fin.dropped >= 235 && fin.presented + fin.dropped <= 240, `frames shown+dropped ${fin.presented}+${fin.dropped} ${JSON.stringify(fin)}`);
   sync.reconnects = fin.reconnects; sync.presented = fin.presented;
   assert.deepEqual(page.errors, []);
   record('A/V fixture: audible after click, audio-master clock, avg video lateness vs audio clock < 25 ms, pause/resume, volume 0, plays to end across forced reconnects', 'canvas', 'pass',

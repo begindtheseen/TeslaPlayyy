@@ -11,12 +11,15 @@ import path from 'node:path';
 
 export const DASH_SECONDS = 36;
 
-export function ensureDashFixture(dir = path.join(tmpdir(), 'canvastube-dash-v2')) {
+export function ensureDashFixture(dir, { width = 640, height = 360, fps = 30, seconds = DASH_SECONDS, bitrate = '500k' } = {}) {
+  dir ??= path.join(tmpdir(), width === 640 && fps === 30 && seconds === DASH_SECONDS ? 'canvastube-dash-v2' : `canvastube-dash-v2-${width}x${height}p${fps}-${seconds}s`);
   const files = { video: path.join(dir, 'v.mp4'), audio: path.join(dir, 'a.m4a'), progressive: path.join(dir, 'p.mp4') };
-  if (Object.values(files).every(f => existsSync(f) && statSync(f).size > 1000)) return { dir, files };
+  const meta = { width, height, fps, seconds };
+  if (Object.values(files).every(f => existsSync(f) && statSync(f).size > 1000)) return { dir, files, meta };
   mkdirSync(dir, { recursive: true });
-  const src = ['-f', 'lavfi', '-i', `testsrc2=size=640x360:rate=30:duration=${DASH_SECONDS},drawbox=x=0:y=0:w=160:h=90:color=white:t=fill:enable='lt(mod(t,1),0.25)'`, '-f', 'lavfi', '-i', `sine=frequency=1000:sample_rate=44100:beep_factor=4:duration=${DASH_SECONDS}`];
-  const v = ['-c:v', 'libx264', '-profile:v', 'high', '-level', '4.0', '-pix_fmt', 'yuv420p', '-g', '60', '-keyint_min', '60', '-sc_threshold', '0', '-bf', '2', '-b:v', '500k'];
+  const bw = Math.round(width / 4), bh = Math.round(height / 4);
+  const src = ['-f', 'lavfi', '-i', `testsrc2=size=${width}x${height}:rate=${fps}:duration=${seconds},drawbox=x=0:y=0:w=${bw}:h=${bh}:color=white:t=fill:enable='lt(mod(t,1),0.25)'`, '-f', 'lavfi', '-i', `sine=frequency=1000:sample_rate=44100:beep_factor=4:duration=${seconds}`];
+  const v = ['-c:v', 'libx264', '-preset', width > 1000 ? 'veryfast' : 'medium', '-profile:v', 'high', '-level', height > 720 ? '4.2' : '4.0', '-pix_fmt', 'yuv420p', '-g', String(fps * 2), '-keyint_min', String(fps * 2), '-sc_threshold', '0', '-bf', '2', '-b:v', bitrate];
   const a = ['-c:a', 'aac', '-b:a', '96k', '-ac', '2'];
   const run = args => {
     const r = spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', ...args], { stdio: ['ignore', 'ignore', 'pipe'] });
@@ -25,8 +28,8 @@ export function ensureDashFixture(dir = path.join(tmpdir(), 'canvastube-dash-v2'
   run([...src, '-map', '0:v', ...v, '-f', 'mp4', '-movflags', '+dash+global_sidx', files.video]);
   run([...src, '-map', '1:a', ...a, '-f', 'mp4', '-movflags', '+dash+global_sidx', '-frag_duration', '2000000', files.audio]);
   run([...src, '-map', '0:v', '-map', '1:a', ...v, ...a, '-movflags', '+faststart', files.progressive]);
-  return { dir, files };
+  return { dir, files, meta };
 }
 
 // CLI: node test/helpers/dashFixture.js [dir]
-if (import.meta.url === `file://${process.argv[1]}`) console.log(ensureDashFixture(process.argv[2]));
+if (import.meta.url === `file://${process.argv[1]}`) console.log(ensureDashFixture(process.argv[2] || undefined));
