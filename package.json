@@ -9,7 +9,8 @@
     "test:e2e": "node --test --test-concurrency=1 test/e2e/*.e2e.js",
     "fixtures": "bash scripts/generate-fixtures.sh",
     "test:perf": "node --test --test-concurrency=1 test/e2e/perf.bench.js",
-    "dev:fake-youtube": "node test/helpers/serve-fake-youtube.mjs npx next dev"
+    "dev:fake-youtube": "node test/helpers/serve-fake-youtube.mjs npx next dev",
+    "deploy:hetzner": "node scripts/deploy-hetzner.mjs"
   },
   "dependencies": {
     "https-proxy-agent": "^7.0.6",
